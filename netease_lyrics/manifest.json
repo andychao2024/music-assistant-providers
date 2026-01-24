@@ -1,0 +1,12 @@
+{
+  "type": "metadata",
+  "domain": "netease_lyrics",
+  "stage": "EXPERIMENTAL",
+  "name": "NetEase lyrics",
+  "description": "云音乐API歌词插件，支持其他提供者自动补全。pulling song lyrics from Netease Cloud Music API to supplement other providers.",
+  "codeowners": ["@andychao"],
+  "credits": ["NCP API"],
+  "requirements": [],
+  "documentation": "",
+  "icon": "folder-information"
+}

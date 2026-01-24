@@ -1,0 +1,14 @@
+{
+  "type": "metadata",
+  "domain": "musicbrainz",
+  "stage": "EXPERIMENTAL",
+  "name": "MusicBrainz",
+  "description": "魔改版 MusicBrainz 首次使用需要设置你的 Netease API URL",
+  "codeowners": ["@music-assistant"],
+  "requirements": [],
+  "documentation": "",
+  "multi_instance": false,
+  "builtin": true,
+  "allow_disable": false,
+  "icon": "mdi-folder-information"
+}
