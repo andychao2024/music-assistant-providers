@@ -1,0 +1,2 @@
+# 忽略GitHub Actions工作流配置
+.github/workflows/
