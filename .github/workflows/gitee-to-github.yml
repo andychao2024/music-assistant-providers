@@ -1,0 +1,28 @@
+name: Sync Gitee to GitHub
+
+# 触发条件：通过 Gitee WebHook 触发，或手动触发
+on:
+  repository_dispatch:
+    types: [gitee-push] # 匹配 Gitee WebHook 的触发类型
+  workflow_dispatch: # 手动触发
+
+jobs:
+  sync-to-github:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 Gitee 代码
+        uses: actions/checkout@v4
+        with:
+          repository: andychao2020/music-assistant-providers
+          fetch-depth: 0
+          ssh-key: ${{ secrets.GITEE_RSA_PRIVATE_KEY }} # 用 Gitee SSH 私钥拉取
+
+      - name: 添加 GitHub 远程仓库
+        run: |
+          git remote add github git@github.com:andychao2024/music-assistant-providers.git
+          git config --global user.name "andychao2024"
+          git config --global user.email "511092004@qq.com"
+
+      - name: 推送到 GitHub
+        run: |
+          git push --force github main # 强制推送（确保同步完整，按需调整）
