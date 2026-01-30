@@ -113,3 +113,7 @@ temp/
 *.key
 *.pem
 secrets/
+# 忽略 GitHub Actions 工作流目录
+.github/
+# 忽略 .gitignore 文件本身
+.gitignore
