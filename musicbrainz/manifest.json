@@ -1,9 +1,9 @@
 {
   "type": "metadata",
   "domain": "musicbrainz",
-  "stage": "EXPERIMENTAL",
+  "stage": "beta",
   "name": "MusicBrainz",
-  "description": "魔改版 MusicBrainz 首次使用需要设置你的 Netease API URL",
+  "description": "魔改版 MusicBrainz 首次使用需要设置你的 Netease Api",
   "codeowners": ["@music-assistant"],
   "requirements": [],
   "documentation": "",
