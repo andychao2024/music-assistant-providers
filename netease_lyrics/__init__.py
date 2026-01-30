@@ -2,6 +2,7 @@
 Netease Cloud Music API Lyrics Metadata Provider for Music Assistant
 云音乐API 歌词自动补全（支持毫秒级歌词同步）
 Version 1.2.8 - 新增“更新已有歌词”开关
+获取最新版本 https://gitee.com/andychao2020/music-assistant-providers
 """
 
 from __future__ import annotations
