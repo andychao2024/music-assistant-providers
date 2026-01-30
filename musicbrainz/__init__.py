@@ -1,4 +1,6 @@
-"""The NetEase Metadata provider for Music Assistant (forked from Musicbrainz)."""
+"""The NetEase Metadata provider for Music Assistant (forked from Musicbrainz).
+   获取最新版本 https://gitee.com/andychao2020/music-assistant-providers
+"""
 
 from __future__ import annotations
 
