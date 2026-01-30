@@ -29,19 +29,21 @@ main/
 1. docker 版使用教程
 https://club.fnnas.com/forum.php?mod=viewthread&tid=51039
 
-2. 加载项使用教程
+2. home-assistant 加载项使用教程
 https://bbs.hassbian.com/thread-31177-1-1.html
 
+###  :tw-26a0:提醒
+本插件需要依赖网易云音乐 API Enhanced,请自行部署
+项目地址 https://github.com/neteasecloudmusicapienhanced/api-enhanced 
 
-### ⚠️ 免责声明
-本项目仅供学习和研究使用，使用本项目所产生的一切后果由使用者自行承担。请遵守相关法律法规，不得用于非法用途。
-
-### 🤝 参与贡献
+###  :speech_balloon: 参与贡献
 
 欢迎所有形式的贡献，包括但不限于：
-
 1. 🐛 提交 Bug 报告
 2. 💡 提出新功能建议
 3. 📝 改进文档
 4. 🔧 提交代码修复或新功能
+
+###   ⚠️ 免责声明
+本项目仅供学习和研究使用，使用本项目所产生的一切后果由使用者自行承担。请遵守相关法律法规，不得用于非法用途。
 
