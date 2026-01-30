@@ -1,4 +1,6 @@
-"""云音乐元数据提供者 for Music Assistant UI (v1.7.5 精简版)."""
+"""云音乐元数据提供者 for Music Assistant UI (v1.7.5 发布版).
+获取最新版本 https://gitee.com/andychao2020/music-assistant-providers
+"""
 
 from __future__ import annotations
 
