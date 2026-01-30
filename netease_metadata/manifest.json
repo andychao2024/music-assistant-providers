@@ -3,7 +3,7 @@
   "domain": "netease_metadata",
   "stage": "beta",
   "name": "NetEase Metadata",
-  "description": "云音乐API元数据插件,支持歌手、专辑、歌曲图片自动补全。Provides artist images,album art,and rich textual metadata from NetEaseAPI for use in the Music Assistant Ul.",
+  "description": "云音乐API元数据插件。Provides artist images,album art,and rich textual metadata from NetEaseAPI for use in the Music Assistant Ul.",
   "codeowners": ["@andychao"],
   "credits": ["NCP API"],
   "requirements": [],
