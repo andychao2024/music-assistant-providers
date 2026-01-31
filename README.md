@@ -27,14 +27,14 @@ main/
 ### 📚使用教程
 
 1. docker 版使用教程
-https://club.fnnas.com/forum.php?mod=viewthread&tid=51039
+
 
 2. home-assistant 加载项使用教程
-https://bbs.hassbian.com/thread-31177-1-1.html
+
 
 ###  :tw-26a0:提醒
-本插件需要依赖网易云音乐 API Enhanced,请自行部署
-项目地址 https://github.com/neteasecloudmusicapienhanced/api-enhanced 
+本插件需要依赖网易云音乐 API Enhanced,请先自行部署
+https://gitee.com/a1_panda/api-enhanced
 
 ###  :speech_balloon: 参与贡献
 
