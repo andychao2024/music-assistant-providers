@@ -1,10 +1,10 @@
 {
   "type": "metadata",
   "domain": "netease_lyrics",
-  "stage": "beta",
+  "stage": "stable",
   "name": "NetEase lyrics",
   "description": "云音乐API歌词插件。",
-  "codeowners": ["@andychao"],
+  "codeowners": ["@andychao2024"],
   "credits": ["NCP API"],
   "requirements": [],
   "documentation": "",
