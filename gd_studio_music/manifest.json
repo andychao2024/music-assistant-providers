@@ -1,0 +1,10 @@
+{
+  "type": "music",
+  "domain": "gd_studio_music",
+  "name": "GDstudio music",
+  "description": "Music provider for GD音乐台(music.gdstudio.xyz)",
+  "documentation": "https://github.com/andychao2024",
+  "codeowners": ["@andychao2024"],
+  "multi_instance": true,
+  "version": "1.1.21"
+}
