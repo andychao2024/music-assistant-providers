@@ -1,5 +1,5 @@
 """The NetEase Metadata provider for Music Assistant (forked from Musicbrainz).
-   获取最新版本 https://gitee.com/andychao2020/music-assistant-providers
+2026.02.05  优化自刷新效率
 """
 
 from __future__ import annotations
@@ -36,29 +36,32 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
-# 核心配置
+# ------------------------------
+# 核心配置（优化性能相关参数）
+# ------------------------------
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 CONF_NETEASE_API_URL = "netease_api_url" 
-DEFAULT_NETEASE_API_URL = "http://BaseURL:3003"
+DEFAULT_NETEASE_API_URL = "http://localhost:3003"
 
-# 限流与缓存配置
-THROTTLE_RATE_LIMIT = 3
-THROTTLE_PERIOD = 30
+# 优化：调整限流配置
+THROTTLE_RATE_LIMIT = 5  
+THROTTLE_PERIOD = 1
+# 缓存时长
 CACHE_TTL = 3600
-REQUEST_TIMEOUT = 10
+# 请求超时时间（延长至5秒避免请求失败）
+REQUEST_TIMEOUT = 5
 
-# 生成占位符ID
+# 仅保留：生成合法占位符ID的核心函数（强制UUID格式）
 @lru_cache(maxsize=1000)
 def generate_placeholder_id(name: str) -> str:
-    """生成符合UUID格式的占位符ID"""
+    """生成符合UUID格式的占位符ID，避免Invalid MusicBrainz identifier错误."""
     namespace = uuid.NAMESPACE_OID
-    placeholder_id = str(uuid.uuid5(namespace, f"netease_{name}"))
-    return placeholder_id
+    return str(uuid.uuid5(namespace, f"netease_{name}"))
 
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
-    """初始化Provider实例"""
+    """Initialize provider(instance) with given configuration."""
     return MusicbrainzProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 async def get_config_entries(
@@ -67,7 +70,7 @@ async def get_config_entries(
     action: str | None = None,
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
-    """返回配置项"""
+    """Return Config entries to setup this provider."""
     from music_assistant_models.config_entries import ConfigEntry, ConfigEntryType
     return (
         ConfigEntry(
@@ -83,14 +86,14 @@ async def get_config_entries(
 def replace_hyphens(
     data: dict[str, Any] | list[dict[str, Any]] | Any,
 ) -> dict[str, Any] | list[dict[str, Any]] | Any:
-    """将连字符键替换为下划线"""
+    """Change all hyphened keys to underscores."""
     if isinstance(data, dict):
         return {key.replace("-", "_"): replace_hyphens(value) for key, value in data.items()}
     if isinstance(data, list):
         return [replace_hyphens(x) for x in data]
     return data
 
-# 数据模型类
+# 数据模型类保持不变
 @dataclass
 class MusicBrainzTag(DataClassDictMixin):
     count: int
@@ -206,7 +209,7 @@ class MusicBrainzRecording(DataClassDictMixin):
         return MusicBrainzRecording.from_dict(alt_data)
 
 class MusicbrainzProvider(MetadataProvider):
-    """网易云音乐元数据提供器"""
+    """The NetEase Metadata provider (forked from Musicbrainz)."""
     throttler = ThrottlerManager(rate_limit=THROTTLE_RATE_LIMIT, period=THROTTLE_PERIOD)
 
     def __init__(
@@ -218,22 +221,26 @@ class MusicbrainzProvider(MetadataProvider):
         api_url: str = DEFAULT_NETEASE_API_URL,
     ):
         super().__init__(mass, manifest, config, supported_features)
+
         self.api_url = self.config.get_value(CONF_NETEASE_API_URL, DEFAULT_NETEASE_API_URL)
         self.request_headers = {
             "User-Agent": f"Music Assistant/{self.mass.version} (https://music-assistant.io)",
             "Accept": "application/json"
         }
         
+        self.logger.debug(f"[NetEase] 初始化完成，API URL: {self.api_url}")
+        
     async def handle_async_init(self) -> None:
-        """异步初始化"""
+        """Handle async initialization of the provider."""
         self.cache = self.mass.cache
 
     @use_cache(CACHE_TTL)
     async def search(
         self, artistname: str, albumname: str, trackname: str, trackversion: str | None = None
     ) -> tuple[MusicBrainzArtist, MusicBrainzReleaseGroup, MusicBrainzRecording] | None:
-        """搜索网易云音乐元数据"""
+        """Search NetEase details by providing the artist, album and track name."""
         trackname, trackversion = parse_title_and_version(trackname, trackversion)
+        self.logger.debug(f"[NetEase] 搜索: 歌手='{artistname}', 专辑='{albumname}', 歌曲='{trackname}'")
 
         search_params = {
             "keywords": f"{artistname} {albumname} {trackname}",
@@ -245,9 +252,11 @@ class MusicbrainzProvider(MetadataProvider):
             result = await self.get_data("search", **search_params)
 
             if not result or not result.get("result") or not result["result"].get("songs") or len(result["result"]["songs"]) == 0:
+                self.logger.debug(f"[NetEase] 搜索无结果")
                 return None
 
             track_data = result["result"]["songs"][0]
+            self.logger.debug(f"[NetEase] 找到匹配歌曲: ID={track_data.get('id')}, 名称={track_data.get('name')}")
 
             # 数据校验与占位符生成
             required_fields = ["id", "name"]
@@ -257,24 +266,38 @@ class MusicbrainzProvider(MetadataProvider):
                     track_data["id"] = generate_placeholder_id(f"{artistname}_{albumname}_{trackname}")
                 if "name" in missing_fields:
                     track_data["name"] = trackname
+            else:
+                # 强制转换为UUID格式
+                track_data["id"] = generate_placeholder_id(str(track_data["id"]))
 
             # 解析歌手数据
-            if "ar" not in track_data or not isinstance(track_data["ar"], list) or len(track_data["ar"]) == 0:
+            if "artists" not in track_data or not isinstance(track_data["artists"], list) or len(track_data["artists"]) == 0:
                 artist_id = generate_placeholder_id(artistname)
                 artist_data = {"id": artist_id, "name": artistname}
             else:
-                artist_data = track_data["ar"][0]
-                artist_data["id"] = artist_data.get("id", generate_placeholder_id(artist_data.get("name", artistname)))
+                artist_data = track_data["artists"][0]
+                # 核心修复：强制生成UUID
+                raw_artist_id = artist_data.get("id", artistname)
+                artist_id = generate_placeholder_id(str(raw_artist_id))
+                artist_data["id"] = artist_id
                 artist_data["name"] = artist_data.get("name", artistname)
 
             # 解析专辑数据
-            if "al" not in track_data or not isinstance(track_data["al"], dict):
+            if "album" not in track_data or not isinstance(track_data["album"], dict):
                 album_id = generate_placeholder_id(f"{artistname}_{albumname}")
                 album_data = {"id": album_id, "name": albumname}
             else:
-                album_data = track_data["al"]
-                album_data["id"] = album_data.get("id", generate_placeholder_id(album_data.get("name", f"{artistname}_{albumname}")))
+                album_data = track_data["album"]
+                # 核心修复：强制生成UUID
+                raw_album_id = album_data.get("id", f"{artistname}_{albumname}")
+                album_id = generate_placeholder_id(str(raw_album_id))
+                album_data["id"] = album_id
                 album_data["name"] = album_data.get("name", albumname)
+
+            # 时长字段
+            track_duration = track_data.get("duration")
+            if track_duration:
+                track_duration = int(track_duration)
 
             # 构建返回对象
             artist = MusicBrainzArtist(
@@ -295,7 +318,7 @@ class MusicbrainzProvider(MetadataProvider):
             recording = MusicBrainzRecording(
                 id=str(track_data["id"]),
                 title=track_data["name"],
-                length=track_data.get("dt"),
+                length=track_duration,
                 artist_credit=[MusicBrainzArtistCredit(
                     name=artist_data["name"],
                     artist=artist
@@ -303,16 +326,21 @@ class MusicbrainzProvider(MetadataProvider):
                 disambiguation=trackversion
             )
 
+            self.logger.debug(f"[NetEase] 搜索成功，返回元数据")
             return (artist, release_group, recording)
             
-        except KeyError:
+        except KeyError as err:
+            self.logger.debug(f"[NetEase] 搜索失败：缺失字段 {err}")
             return None
-        except Exception:
+        except Exception as err:
+            self.logger.error(f"[NetEase] 搜索异常：{type(err).__name__}: {err}")
             return None
 
     @use_cache(CACHE_TTL)
     async def get_artist_details(self, artist_id: str) -> MusicBrainzArtist:
-        """获取歌手详情"""
+        """Get (full) Artist details by providing a NetEase artist id."""
+        self.logger.debug(f"[NetEase] 获取歌手详情: artist_id='{artist_id}'")
+        
         try:
             uuid.UUID(artist_id)
             if artist_id.startswith(str(uuid.NAMESPACE_OID)[:8]):
@@ -323,7 +351,7 @@ class MusicbrainzProvider(MetadataProvider):
                 )
                 return artist
         except ValueError:
-            pass
+            artist_id = generate_placeholder_id(artist_id)
         
         try:
             result = await self.get_data(f"artist/detail?id={artist_id}")
@@ -333,7 +361,9 @@ class MusicbrainzProvider(MetadataProvider):
                 
             artist_data = result["data"]["artist"]
             
-            artist_id = str(artist_data.get("id", generate_placeholder_id(artist_data.get("name", f"artist_{artist_id}"))))
+            # 强制转换为UUID格式
+            raw_artist_id = artist_data.get("id", f"artist_{artist_id}")
+            artist_id = generate_placeholder_id(str(raw_artist_id))
             artist_name = artist_data.get("name", f"Unknown Artist {artist_id[:8]}")
             
             aliases_list = artist_data.get("alias", [])
@@ -346,9 +376,11 @@ class MusicbrainzProvider(MetadataProvider):
                 aliases=aliases if aliases else None
             )
             
+            self.logger.debug(f"[NetEase] 歌手详情获取成功")
             return artist
             
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"[NetEase] 获取歌手详情异常：{type(e).__name__}: {e}")
             placeholder_id = generate_placeholder_id(f"artist_{artist_id}")
             artist = MusicBrainzArtist(
                 id=placeholder_id,
@@ -359,7 +391,9 @@ class MusicbrainzProvider(MetadataProvider):
 
     @use_cache(CACHE_TTL)
     async def get_recording_details(self, recording_id: str) -> MusicBrainzRecording:
-        """获取歌曲详情"""
+        """Get Recording details by providing a NetEase Recording Id."""
+        self.logger.debug(f"[NetEase] 获取歌曲详情: recording_id='{recording_id}'")
+        
         try:
             uuid.UUID(recording_id)
             if recording_id.startswith(str(uuid.NAMESPACE_OID)[:8]):
@@ -378,7 +412,7 @@ class MusicbrainzProvider(MetadataProvider):
                 )
                 return recording
         except ValueError:
-            pass
+            recording_id = generate_placeholder_id(recording_id)
         
         try:
             result = await self.get_data(f"song/detail?ids={recording_id}")
@@ -388,15 +422,21 @@ class MusicbrainzProvider(MetadataProvider):
                 
             track_data = result["songs"][0]
             
-            if "ar" in track_data and track_data["ar"]:
-                artist_data = track_data["ar"][0]
+            # 解析歌手数据
+            if "artists" in track_data and track_data["artists"]:
+                artist_data = track_data["artists"][0]
+                raw_artist_id = artist_data.get("id", "unknown_artist")
+                artist_id = generate_placeholder_id(str(raw_artist_id))
+                artist_name = artist_data.get("name", "Unknown Artist")
             else:
-                artist_data = {"id": generate_placeholder_id("unknown_artist"), "name": "Unknown Artist"}
+                artist_id = generate_placeholder_id("unknown_artist")
+                artist_name = "Unknown Artist"
 
-            track_id = str(track_data.get("id", generate_placeholder_id(f"track_{recording_id}")))
+            # 强制转换歌曲ID为UUID
+            raw_track_id = track_data.get("id", f"track_{recording_id}")
+            track_id = generate_placeholder_id(str(raw_track_id))
             track_name = track_data.get("name", f"Unknown Track {track_id[:8]}")
-            artist_id = str(artist_data.get("id", generate_placeholder_id("unknown_artist")))
-            artist_name = artist_data.get("name", "Unknown Artist")
+            track_duration = track_data.get("duration")
             
             artist = MusicBrainzArtist(
                 id=artist_id,
@@ -407,16 +447,18 @@ class MusicbrainzProvider(MetadataProvider):
             recording = MusicBrainzRecording(
                 id=track_id,
                 title=track_name,
-                length=track_data.get("dt"),
+                length=int(track_duration) if track_duration else None,
                 artist_credit=[MusicBrainzArtistCredit(
                     name=artist_name,
                     artist=artist
                 )]
             )
             
+            self.logger.debug(f"[NetEase] 歌曲详情获取成功")
             return recording
             
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"[NetEase] 获取歌曲详情异常：{type(e).__name__}: {e}")
             placeholder_id = generate_placeholder_id(f"track_{recording_id}")
             artist = MusicBrainzArtist(
                 id=generate_placeholder_id("unknown_artist"),
@@ -435,7 +477,9 @@ class MusicbrainzProvider(MetadataProvider):
 
     @use_cache(CACHE_TTL)
     async def get_release_details(self, album_id: str) -> MusicBrainzRelease:
-        """获取专辑详情"""
+        """Get Release/Album details by providing a NetEase Album id."""
+        self.logger.debug(f"[NetEase] 获取专辑详情: album_id='{album_id}'")
+        
         try:
             uuid.UUID(album_id)
             if album_id.startswith(str(uuid.NAMESPACE_OID)[:8]):
@@ -467,7 +511,7 @@ class MusicbrainzProvider(MetadataProvider):
                 )
                 return release
         except ValueError:
-            pass
+            album_id = generate_placeholder_id(album_id)
         
         try:
             result = await self.get_data(f"album/detail?id={album_id}")
@@ -477,12 +521,16 @@ class MusicbrainzProvider(MetadataProvider):
                 
             album_data = result["album"]
             
-            artist_data = album_data.get("artist", {"id": generate_placeholder_id("unknown_artist"), "name": "Unknown Artist"})
-
-            album_id = str(album_data.get("id", generate_placeholder_id(f"album_{album_id}")))
-            album_name = album_data.get("name", f"Unknown Album {album_id[:8]}")
-            artist_id = str(artist_data.get("id", generate_placeholder_id("unknown_artist")))
+            # 解析歌手数据
+            artist_data = album_data.get("artist", album_data.get("artists", [{"id": "unknown_artist", "name": "Unknown Artist"}])[0])
+            raw_artist_id = artist_data.get("id", "unknown_artist")
+            artist_id = generate_placeholder_id(str(raw_artist_id))
             artist_name = artist_data.get("name", "Unknown Artist")
+
+            # 强制转换专辑ID为UUID
+            raw_album_id = album_data.get("id", f"album_{album_id}")
+            album_id = generate_placeholder_id(str(raw_album_id))
+            album_name = album_data.get("name", f"Unknown Album {album_id[:8]}")
             
             publish_time = album_data.get("publishTime")
             publish_date = str(publish_time)[:10] if publish_time else None
@@ -513,9 +561,11 @@ class MusicbrainzProvider(MetadataProvider):
                 date=publish_date
             )
             
+            self.logger.debug(f"[NetEase] 专辑详情获取成功")
             return release
             
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"[NetEase] 获取专辑详情异常：{type(e).__name__}: {e}")
             placeholder_id = generate_placeholder_id(f"album_{album_id}")
             artist = MusicBrainzArtist(
                 id=generate_placeholder_id("unknown_artist"),
@@ -547,7 +597,9 @@ class MusicbrainzProvider(MetadataProvider):
 
     @use_cache(CACHE_TTL)
     async def get_releasegroup_details(self, releasegroup_id: str) -> MusicBrainzReleaseGroup:
-        """获取专辑组详情"""
+        """Get ReleaseGroup details by providing a NetEase ReleaseGroup id."""
+        self.logger.debug(f"[NetEase] 获取专辑组详情: releasegroup_id='{releasegroup_id}'")
+        
         try:
             uuid.UUID(releasegroup_id)
             if releasegroup_id.startswith(str(uuid.NAMESPACE_OID)[:8]):
@@ -566,7 +618,7 @@ class MusicbrainzProvider(MetadataProvider):
                 )
                 return release_group
         except ValueError:
-            pass
+            releasegroup_id = generate_placeholder_id(releasegroup_id)
         
         try:
             result = await self.get_data(f"album/detail?id={releasegroup_id}")
@@ -576,12 +628,16 @@ class MusicbrainzProvider(MetadataProvider):
                 
             album_data = result["album"]
             
-            artist_data = album_data.get("artist", {"id": generate_placeholder_id("unknown_artist"), "name": "Unknown Artist"})
-
-            album_id = str(album_data.get("id", generate_placeholder_id(f"releasegroup_{releasegroup_id}")))
-            album_name = album_data.get("name", f"Unknown Album {album_id[:8]}")
-            artist_id = str(artist_data.get("id", generate_placeholder_id("unknown_artist")))
+            # 解析歌手数据
+            artist_data = album_data.get("artist", album_data.get("artists", [{"id": "unknown_artist", "name": "Unknown Artist"}])[0])
+            raw_artist_id = artist_data.get("id", "unknown_artist")
+            artist_id = generate_placeholder_id(str(raw_artist_id))
             artist_name = artist_data.get("name", "Unknown Artist")
+
+            # 强制转换专辑组ID为UUID
+            raw_album_id = album_data.get("id", f"releasegroup_{releasegroup_id}")
+            album_id = generate_placeholder_id(str(raw_album_id))
+            album_name = album_data.get("name", f"Unknown Album {album_id[:8]}")
             
             artist = MusicBrainzArtist(
                 id=artist_id,
@@ -598,9 +654,11 @@ class MusicbrainzProvider(MetadataProvider):
                 )]
             )
             
+            self.logger.debug(f"[NetEase] 专辑组详情获取成功")
             return release_group
             
-        except Exception:
+        except Exception as e:
+            self.logger.error(f"[NetEase] 获取专辑组详情异常：{type(e).__name__}: {e}")
             placeholder_id = generate_placeholder_id(f"releasegroup_{releasegroup_id}")
             artist = MusicBrainzArtist(
                 id=generate_placeholder_id("unknown_artist"),
@@ -620,7 +678,9 @@ class MusicbrainzProvider(MetadataProvider):
     async def get_artist_details_by_album(
         self, artistname: str, ref_album: Album
     ) -> MusicBrainzArtist | None:
-        """通过专辑匹配歌手"""
+        """Get NetEase artist details by providing the artist name and a reference album."""
+        self.logger.debug(f"[NetEase] 通过专辑匹配歌手: '{artistname}' -> '{ref_album.name}'")
+        
         if mb_id := ref_album.get_external_id(ExternalID.MB_RELEASEGROUP):
             with suppress(InvalidDataError):
                 result = await self.get_releasegroup_details(mb_id)
@@ -628,7 +688,7 @@ class MusicbrainzProvider(MetadataProvider):
                     for artist_credit in result.artist_credit:
                         if compare_strings(artist_credit.artist.name, artistname):
                             return artist_credit.artist
-                            
+            
         if mb_id := ref_album.get_external_id(ExternalID.MB_ALBUM):
             with suppress(InvalidDataError):
                 result = await self.get_release_details(mb_id)
@@ -637,13 +697,17 @@ class MusicbrainzProvider(MetadataProvider):
                         if compare_strings(artist_credit.artist.name, artistname):
                             return artist_credit.artist
                             
+        self.logger.debug(f"[NetEase] 通过专辑未找到歌手: '{artistname}'")
         return None
 
     async def get_artist_details_by_track(
         self, artistname: str, ref_track: Track
     ) -> MusicBrainzArtist | None:
-        """通过歌曲匹配歌手"""
+        """Get NetEase artist details by providing the artist name and a reference track."""
+        self.logger.debug(f"[NetEase] 通过歌曲匹配歌手: '{artistname}' -> '{ref_track.name}'")
+        
         if not ref_track.mbid:
+            self.logger.debug(f"[NetEase] 歌曲无MBID，匹配失败")
             return None
             
         with suppress(InvalidDataError):
@@ -653,18 +717,20 @@ class MusicbrainzProvider(MetadataProvider):
                     if compare_strings(artist_credit.artist.name, artistname):
                         return artist_credit.artist
                         
+        self.logger.debug(f"[NetEase] 通过歌曲未找到歌手: '{artistname}'")
         return None
 
     async def get_artist_details_by_resource_url(
         self, resource_url: str
     ) -> MusicBrainzArtist | None:
-        """通过URL匹配歌手（暂不支持）"""
+        """Get NetEase artist details by providing a resource URL."""
+        self.logger.debug(f"[NetEase] 暂不支持URL匹配: {resource_url}")
         return None
 
     @use_cache(CACHE_TTL)
     @throttle_with_retries
     async def get_data(self, endpoint: str, **kwargs: str) -> Any:
-        """调用云音乐API获取数据"""
+        """Get data from NetEase API."""
         url = f"{self.api_url.rstrip('/')}/{endpoint.lstrip('/')}"
         
         try:
@@ -691,6 +757,6 @@ class MusicbrainzProvider(MetadataProvider):
                 return data
                 
         except Exception as err:
+            self.logger.error(f"[NetEase] API请求失败: {type(err).__name__}: {err}")
             raise
-
         return None
