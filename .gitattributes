@@ -1,0 +1,6 @@
+# 不下载 screenshot 目录及其所有内容
+screenshot/ export-ignore
+
+# 不下载 License 和 README.md 文件
+License export-ignore
+README.md export-ignore
