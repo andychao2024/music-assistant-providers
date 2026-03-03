@@ -2,10 +2,10 @@
 
 适合国人使用 Music Assistant 最强插件，支持歌手（简介）、专辑、图片、歌词自动补全 
 
+![歌手简介]](screenshot/artists_demo.png "歌手演示.jpg")
 
-![歌手简介](https://foruda.gitee.com/images/1769740086725691994/237177b6_8703437.png "歌手简介.png")
-![歌手演示](https://foruda.gitee.com/images/1769739476707515458/3f21a549_8703437.jpeg "歌手演示.jpg")
-![唱片集](https://foruda.gitee.com/images/1769739440639151325/cd547302_8703437.png "唱片集.png")
+![歌手演示](screenshot/artists.png "歌手演示.jpg")
+![唱片集](screenshot/albums.png "唱片集.png")
 
 
 #### 🎯插件代码是本人学习Pytone时编写及豆包修正生成的，歌曲元数据来源需要配合云音乐API使用。 插件代码绿色开源，符合Music Assistant插件开发Demo。
@@ -18,6 +18,7 @@
 
 ```
 main/
+├── gd_studio_music/    #GD音乐源
 ├── musicbrainz/    #魔改版
 ├── netease_metadata/ #元数据补全插件
 ├── netease_lyrics/     # 歌词插件
