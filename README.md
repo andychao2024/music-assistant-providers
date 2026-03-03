@@ -2,9 +2,11 @@
 
 适合国人使用 Music Assistant 最强插件，支持歌手（简介）、专辑、图片、歌词自动补全 
 
-![输入图片说明](screenshot/artists_demo.png)
+![歌手详情](screenshot/artists_demo.png)
 ![歌手演示](screenshot/artists.png)
-![唱片集](screenshot/albums.png)
+![专辑演示](screenshot/albums.png)
+![专辑详情](screenshot/album_details.png)
+![歌词演示](screenshot/lyrics_demo.png)
 
 
 #### 🎯插件代码是本人学习Pytone时编写及豆包修正生成的，歌曲元数据来源需要配合云音乐API使用。 插件代码绿色开源，符合Music Assistant插件开发Demo。
@@ -32,7 +34,7 @@ main/
 2. home-assistant 加载项使用教程
 
 
-###  :tw-26a0:提醒
+###  :tw-26a0: 提醒
 本插件需要依赖网易云音乐 API Enhanced,请先自行部署
 https://gitee.com/a1_panda/api-enhanced
 
