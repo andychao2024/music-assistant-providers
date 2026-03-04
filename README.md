@@ -27,11 +27,38 @@ main/
 
 ### 📚使用教程
 
-1. docker 版使用教程
+1. docker compose 版使用教程
+
+```
+services:
+  music-assistant-server:
+    image: ghcr.nju.edu.cn/music-assistant/server:beta # 可替换为beta版本以获取最新测试版
+    container_name: music-assistant
+    restart: unless-stopped
+    # 网络模式必须设置为host，Music Assistant才能正常工作
+    network_mode: host
+    volumes:
+      - ./providers/netease_metadata:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_metadata  # 插件目录挂载
+      - ./providers/musicbrainz:/app/venv/lib/python3.13/site-packages/music_assistant/providers/musicbrainz  # musicbrainz
+      - ./providers/netease_lyrics:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_lyrics  # netease_lyrics
+      - ./providers/ncloud_music:/app/venv/lib/python3.13/site-packages/music_assistant/providers/ncloud_music # ncloud_music
+      - ./providers/gd_studio_music:/app/venv/lib/python3.13/site-packages/music_assistant/providers/gd_studio_music # GD_Studio_music
+      - ./data:/data
+      - /你的音乐存放目录:/music  #挂载本地音乐目录
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+    security_opt:
+      - apparmor:unconfined
+    environment:
+      # 日志级别配置，默认值为info，可选值：critical、error、warning、info、debug
+      - LOG_LEVEL=info
+      - TZ=Asia/Shanghai
+```
 
 
 2. home-assistant 加载项使用教程
-
+https://github.com/neqq3/ma_custom_loader
 
 ###  :tw-26a0: 提醒
 本插件需要依赖网易云音乐 API Enhanced,请先自行部署
