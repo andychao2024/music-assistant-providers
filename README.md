@@ -27,12 +27,12 @@ main/
 
 ### 📚使用教程
 
-1. docker compose 版使用教程
+1. docker compose 版安装
 
 ```
 services:
   music-assistant-server:
-    image: ghcr.nju.edu.cn/music-assistant/server:beta # 可替换为beta版本以获取最新测试版
+    image: ghcr.nju.edu.cn/music-assistant/server:latest # 可替换为beta版本以获取最新测试版
     container_name: music-assistant
     restart: unless-stopped
     # 网络模式必须设置为host，Music Assistant才能正常工作
