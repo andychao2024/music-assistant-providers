@@ -41,7 +41,6 @@ services:
       - ./providers/netease_metadata:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_metadata  # 插件目录挂载
       - ./providers/musicbrainz:/app/venv/lib/python3.13/site-packages/music_assistant/providers/musicbrainz  # musicbrainz
       - ./providers/netease_lyrics:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_lyrics  # netease_lyrics
-      - ./providers/ncloud_music:/app/venv/lib/python3.13/site-packages/music_assistant/providers/ncloud_music # ncloud_music
       - ./providers/gd_studio_music:/app/venv/lib/python3.13/site-packages/music_assistant/providers/gd_studio_music # GD_Studio_music
       - ./data:/data #数据持久化
       - /你的音乐存放目录:/music  #挂载本地音乐目录
