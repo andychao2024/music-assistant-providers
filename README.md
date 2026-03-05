@@ -32,7 +32,7 @@ main/
 ```
 services:
   music-assistant-server:
-    image: ghcr.nju.edu.cn/music-assistant/server:latest # 可替换为beta版本以获取最新测试版
+    image: ghcr.nju.edu.cn/music-assistant/server:latest # 南京大学源可替换为beta版本以获取最新测试版
     container_name: music-assistant
     restart: unless-stopped
     # 网络模式必须设置为host，Music Assistant才能正常工作
@@ -43,7 +43,7 @@ services:
       - ./providers/netease_lyrics:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_lyrics  # netease_lyrics
       - ./providers/ncloud_music:/app/venv/lib/python3.13/site-packages/music_assistant/providers/ncloud_music # ncloud_music
       - ./providers/gd_studio_music:/app/venv/lib/python3.13/site-packages/music_assistant/providers/gd_studio_music # GD_Studio_music
-      - ./data:/data
+      - ./data:/data #数据持久化
       - /你的音乐存放目录:/music  #挂载本地音乐目录
     cap_add:
       - SYS_ADMIN
@@ -60,10 +60,26 @@ services:
 2. home-assistant 加载项使用教程
 https://github.com/neqq3/ma_custom_loader
 
+
 ###  :tw-26a0: 提醒
 本插件需要依赖网易云音乐 API Enhanced,请先自行部署
 https://gitee.com/a1_panda/api-enhanced
 
+docker compose 部署云音乐API
+
+```
+services:
+  ncm-api:
+    container_name: ncm-api
+    image: moefurina/ncm-api:latest
+    ports:
+      - "3003:3000"
+    restart: always
+    user: root
+    environment:
+      - TZ=Asia/Shanghai
+    network_mode: bridge 
+```
 ###  :speech_balloon: 参与贡献
 
 欢迎所有形式的贡献，包括但不限于：
