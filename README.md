@@ -27,7 +27,7 @@ main/
 
 ### 📚使用教程
 
-1. docker compose 版安装
+docker compose 版安装
 
 ```
 services:
@@ -57,12 +57,12 @@ services:
 ```
 
 
-2. home-assistant 加载项使用教程
+home-assistant 加载项使用教程
 https://github.com/neqq3/ma_custom_loader
 
 
 ###  :tw-26a0: 提醒
-本插件需要依赖网易云音乐 API Enhanced,请先自行部署
+本插件需要依赖网易云音乐 API Enhanced,请自行部署
 https://gitee.com/a1_panda/api-enhanced
 
 docker compose 部署云音乐API
