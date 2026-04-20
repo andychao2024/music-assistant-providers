@@ -1,0 +1,12 @@
+{
+  "type": "metadata",
+  "domain": "douban_metadata",
+  "stage": "beta",
+  "name": "Douban Metadata",
+  "description": "豆瓣音乐元数据插件。Provides artist images, album art, genres, release year, and rich textual metadata by scraping music.douban.com for use in the Music Assistant UI.",
+  "codeowners": ["@andychao2024"],
+  "credits": ["Douban Music (music.douban.com)"],
+  "requirements": [],
+  "documentation": "",
+  "icon": "folder-information"
+}
