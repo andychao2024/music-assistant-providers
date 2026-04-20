@@ -1,7 +1,12 @@
 #### 📖介绍
 
-适合国人使用 Music Assistant 最强插件，支持歌手（简介）、专辑、图片、歌词自动补全 
+### 适合国人使用 Music Assistant 最强插件，支持歌手（简介）、专辑、图片、歌词自动补全 
 
+##### 2026.4.20 新增支持豆瓣元数据
+
+![豆瓣歌手](screenshot/duoban_artists.png)
+![豆瓣专辑](screenshot/duoban_albums.png)
+##### 网易云音乐演示元数据
 ![歌手详情](screenshot/artists_demo.png)
 ![歌手演示](screenshot/artists.png)
 ![专辑演示](screenshot/albums.png)
@@ -20,6 +25,7 @@
 main/
 ├── gd_studio_music/    #GD音乐源
 ├── musicbrainz/    #魔改版
+├── douban_metadata/ #豆瓣元数据
 ├── netease_metadata/ #元数据补全插件
 ├── netease_lyrics/     # 歌词插件
 └── README.md         # 说明文档
@@ -27,7 +33,7 @@ main/
 
 ### 📚使用教程
 
-docker compose 版安装
+docker compose 版安装（推荐）
 
 ```
 services:
@@ -38,10 +44,11 @@ services:
     # 网络模式必须设置为host，Music Assistant才能正常工作
     network_mode: host
     volumes:
-      - ./providers/netease_metadata:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_metadata  # 插件目录挂载
-      - ./providers/musicbrainz:/app/venv/lib/python3.13/site-packages/music_assistant/providers/musicbrainz  # musicbrainz
+      - ./providers/netease_metadata:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_metadata  # 网易元数据
+      - ./providers/musicbrainz:/app/venv/lib/python3.13/site-packages/music_assistant/providers/musicbrainz  # musicbrainz魔改版
       - ./providers/netease_lyrics:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_lyrics  # netease_lyrics
       - ./providers/gd_studio_music:/app/venv/lib/python3.13/site-packages/music_assistant/providers/gd_studio_music # GD_Studio_music
+      - ./providers/douban_metadata:/app/venv/lib/python3.13/site-packages/music_assistant/providers/douban_metadata # 豆瓣元数据
       - ./data:/data #数据持久化
       - /你的音乐存放目录:/music  #挂载本地音乐目录
     cap_add:
