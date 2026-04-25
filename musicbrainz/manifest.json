@@ -1,9 +1,9 @@
 {
   "type": "metadata",
   "domain": "musicbrainz",
-  "stage": "beta",
+  "stage": "stable",
   "name": "MusicBrainz",
-  "description": "魔改版 MusicBrainz 首次使用需要设置你的 Netease Api",
+  "description": "MusicBrainz is an open music encyclopedia that collects music metadata and makes it available to the public. Music Assistant uses MusicBrainz primarily to identify (unique) media items and therefore this provider can not be disabled. However, note that lookups will only be performed if this info is absent locally. Modified: generates placeholder UUIDs for artists not found in MusicBrainz so downstream providers can still be triggered.",
   "codeowners": ["@music-assistant"],
   "requirements": [],
   "documentation": "",
