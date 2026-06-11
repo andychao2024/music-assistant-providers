@@ -8,7 +8,7 @@ from __future__ import annotations
 import asyncio
 from json import JSONDecodeError
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast, Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Any
 from datetime import datetime
 
 import aiohttp.client_exceptions
@@ -44,7 +44,7 @@ if TYPE_CHECKING:
     from music_assistant.models import ProviderInstanceType
 
 # 常量定义
-SUPPORTED_FEATURES: Set[ProviderFeature] = {
+SUPPORTED_FEATURES: set[ProviderFeature] = {
     ProviderFeature.ARTIST_METADATA,
     ProviderFeature.ALBUM_METADATA,
     ProviderFeature.TRACK_METADATA,
@@ -74,70 +74,70 @@ ALBUM_IMAGE_PARAM = "?param=500y500"
 class CloudMusicArtistDetail(DataClassDictMixin):
     id: int
     name: str
-    cover: Optional[str] = None
-    avatar: Optional[str] = None
-    briefDesc: Optional[str] = None
-    musicBrainzId: Optional[str] = None
+    cover: str | None = None
+    avatar: str | None = None
+    briefDesc: str | None = None
+    musicBrainzId: str | None = None
 
 @dataclass
 class CloudMusicArtist(DataClassDictMixin):
     id: int
     name: str
-    picUrl: Optional[str] = None
-    genre: Optional[str] = None
-    briefDesc: Optional[str] = None
-    musicBrainzId: Optional[str] = None
+    picUrl: str | None = None
+    genre: str | None = None
+    briefDesc: str | None = None
+    musicBrainzId: str | None = None
 
 @dataclass
 class CloudMusicAlbum(DataClassDictMixin):
     id: int
     name: str
-    picUrl: Optional[str] = None
-    publishTime: Optional[int] = None
-    description: Optional[str] = None
-    tags: Optional[str] = None
-    musicBrainzId: Optional[str] = None
+    picUrl: str | None = None
+    publishTime: int | None = None
+    description: str | None = None
+    tags: str | None = None
+    musicBrainzId: str | None = None
 
 @dataclass
 class CloudMusicTrack(DataClassDictMixin):
     id: int
     name: str
-    ar: List[Dict[str, Any]] = field(default_factory=list)
-    al: Dict[str, Any] = field(default_factory=dict)
-    lyric: Optional[str] = None
-    genre: Optional[str] = None
-    description: Optional[str] = None
+    ar: list[dict[str, Any]] = field(default_factory=list)
+    al: dict[str, Any] = field(default_factory=dict)
+    lyric: str | None = None
+    genre: str | None = None
+    description: str | None = None
 
 # 工具函数
-def clean_artist_name(artist_name: Optional[str]) -> str:
+def clean_artist_name(artist_name: str | None) -> str:
     if not artist_name:
         return ""
-    
+
     cleaned_name = artist_name.strip()
     for sep in ARTIST_NAME_SEPARATORS:
         if sep in cleaned_name:
             cleaned_name = cleaned_name.split(sep)[0].strip()
             break
-    
+
     return ' '.join(cleaned_name.split())
 
-def parse_timestamp(timestamp_ms: Optional[int]) -> Optional[int]:
+def parse_timestamp(timestamp_ms: int | None) -> int | None:
     if not timestamp_ms:
         return None
-    
+
     try:
         return datetime.fromtimestamp(timestamp_ms // 1000).year
     except (ValueError, TypeError):
         return None
 
-def fix_album_image_url(pic_url: Optional[str]) -> Optional[str]:
+def fix_album_image_url(pic_url: str | None) -> str | None:
     if not pic_url:
         return None
     if ALBUM_IMAGE_PARAM not in pic_url:
         return f"{pic_url}{ALBUM_IMAGE_PARAM}"
     return pic_url
 
-def simplify_album_name(album_name: str) -> Tuple[str, str]:
+def simplify_album_name(album_name: str) -> tuple[str, str]:
     simplified = COMMON_SUFFIX_PATTERN.sub('', album_name)
     core_name = simplified
     simplified = SOUNDTRACK_SUFFIX_PATTERN.sub('', simplified)
@@ -189,7 +189,8 @@ class CloudMusicMetadataProvider(MetadataProvider):
         else:
             self.logger.info("[云音乐元数据] v1.9.8 发布版初始化完成")
 
-    async def get_artist_metadata(self, artist: Artist) -> Optional[MediaItemMetadata]:
+    async def get_artist_metadata(self, artist: Artist) -> MediaItemMetadata | None:
+        self.logger.debug("[网易云] get_artist_metadata 被调用: %s", artist.name)
         if not self.enable_artist_metadata:
             return None
         
@@ -231,14 +232,14 @@ class CloudMusicMetadataProvider(MetadataProvider):
             self.logger.error("[云音乐元数据] 艺术家元数据获取失败: %s", cleaned_artist_name)
             return None
 
-    async def _extract_album_id_from_songs(self, search_keywords: List[str], album_name: str, artist_name: str) -> Optional[str]:
+    async def _extract_album_id_from_songs(self, search_keywords: list[str], album_name: str, artist_name: str) -> str | None:
         for idx, keyword in enumerate(search_keywords):
             search_data = await self._get_data(endpoint="search", keywords=keyword, type=1, limit=20)
             
             if not search_data or not search_data.get("result", {}).get("songs"):
                 continue
             
-            album_map: Dict[str, Dict[str, Any]] = {}
+            album_map: dict[str, dict[str, Any]] = {}
             for song in search_data["result"]["songs"]:
                 album_info = song.get("album", {})
                 album_id = str(album_info.get("id", ""))
@@ -268,7 +269,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
         self.logger.debug("[云音乐元数据] 专辑匹配失败: %s (歌曲搜索未找到有效专辑ID)", album_name)
         return None
 
-    async def get_album_metadata(self, album: Album) -> Optional[MediaItemMetadata]:
+    async def get_album_metadata(self, album: Album) -> MediaItemMetadata | None:
         if not self.enable_album_metadata:
             return None
         
@@ -343,14 +344,18 @@ class CloudMusicMetadataProvider(MetadataProvider):
             return await self._build_album_metadata_from_raw(album, album_data_raw, original_artists)
             
         except Exception as e:
-            self.logger.error("[云音乐元数据] 专辑元数据获取失败: %s", cleaned_album_name)
+            self.logger.error("[云音乐元数据] 专辑元数据获取失败: %s, 原因: %s", cleaned_album_name, str(e)[:200])
             album.artists = original_artists
             return None
 
-    async def _build_album_metadata_from_raw(self, album: Album, album_data_raw: Dict[str, Any], original_artists: List[Artist]) -> Optional[MediaItemMetadata]:
+    async def _build_album_metadata_from_raw(self, album: Album, album_data_raw: dict[str, Any], original_artists: list[Artist]) -> MediaItemMetadata | None:
         if not album_data_raw:
             return None
         
+        # 防御：id/name 为 null 时 CloudMusicAlbum.from_dict() 会抛异常
+        if not album_data_raw.get("id") or not album_data_raw.get("name"):
+            self.logger.debug("[云音乐元数据] 专辑详情缺少必要字段 (id/name), 跳过: album_id=%s", album_data_raw.get("id"))
+            return None
         album_data = CloudMusicAlbum.from_dict(album_data_raw)
         album_data.picUrl = fix_album_image_url(album_data_raw.get("picUrl") or album_data.picUrl)
         
@@ -398,7 +403,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
         
         return metadata
 
-    async def get_track_metadata(self, track: Track) -> Optional[MediaItemMetadata]:
+    async def get_track_metadata(self, track: Track) -> MediaItemMetadata | None:
         if not self.enable_track_metadata:
             return None
         
@@ -445,7 +450,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
 
     @use_cache(CACHE_TTL, persistent=True)
     @throttle_with_retries
-    async def _get_data(self, endpoint: str, **kwargs: Any) -> Optional[Dict[str, Any]]:
+    async def _get_data(self, endpoint: str, **kwargs: Any) -> dict[str, Any] | None:
         if not self.api_url:
             return None
         
@@ -462,13 +467,13 @@ class CloudMusicMetadataProvider(MetadataProvider):
                 if response.status in (400, 401, 404):
                     return None
                 response.raise_for_status()
-                return cast(Dict[str, Any], await response.json(loads=json_loads))
+                return await response.json(loads=json_loads)
         except ResourceTemporarilyUnavailable:
             raise
         except Exception:
             return None
 
-    def _build_artist_metadata_v175(self, artist: Artist, artist_search: CloudMusicArtist, artist_detail: Optional[CloudMusicArtistDetail] = None) -> MediaItemMetadata:
+    def _build_artist_metadata_v175(self, artist: Artist, artist_search: CloudMusicArtist, artist_detail: CloudMusicArtistDetail | None = None) -> MediaItemMetadata:
         metadata = MediaItemMetadata()
         use_detail = artist_detail is not None
 
@@ -529,9 +534,9 @@ async def setup(
 
 async def get_config_entries(
     mass: MusicAssistant,
-    instance_id: Optional[str] = None,
-    action: Optional[str] = None,
-    values: Optional[Dict[str, ConfigValueType]] = None,
+    instance_id: str | None = None,
+    action: str | None = None,
+    values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
     return (
         ConfigEntry(

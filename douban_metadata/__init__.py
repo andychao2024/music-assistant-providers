@@ -1,4 +1,4 @@
-"""豆瓣音乐元数据提供者 for Music Assistant (v1.5.1).
+"""豆瓣音乐元数据提供者 for Music Assistant (v1.5.2).
 通过豆瓣公开接口补全音乐库中艺术家简介、专辑封面、流派、发行年份等元数据。
 """
 
@@ -7,7 +7,7 @@ from __future__ import annotations
 import asyncio
 import re
 import urllib.parse
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, cast
+from typing import TYPE_CHECKING, Any
 
 import aiohttp.client_exceptions
 
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
-SUPPORTED_FEATURES: Set[ProviderFeature] = {
+SUPPORTED_FEATURES: set[ProviderFeature] = {
     ProviderFeature.ARTIST_METADATA,
     ProviderFeature.ALBUM_METADATA,
     ProviderFeature.TRACK_METADATA,
@@ -138,7 +138,7 @@ class ConfigKeys:
     ENABLE_IMAGES = "enable_images"
 
 
-def clean_artist_name(name: Optional[str]) -> str:
+def clean_artist_name(name: str | None) -> str:
     if not name:
         return ""
     name = name.strip()
@@ -149,7 +149,7 @@ def clean_artist_name(name: Optional[str]) -> str:
     return " ".join(name.split())
 
 
-def upgrade_img_url(url: Optional[str]) -> Optional[str]:
+def upgrade_img_url(url: str | None) -> str | None:
     if not url:
         return None
     url = _PERSONAGE_IMG_PATTERN.sub(lambda m: m.group(0).replace("/s/", "/l/").replace("/m/", "/l/"), url)
@@ -158,7 +158,7 @@ def upgrade_img_url(url: Optional[str]) -> Optional[str]:
     return url
 
 
-def _upgrade_view_img_url(url: Optional[str]) -> Optional[str]:
+def _upgrade_view_img_url(url: str | None) -> str | None:
     return upgrade_img_url(url)
 
 
@@ -194,8 +194,8 @@ def _unescape(text: str) -> str:
 class DoubanPageParser:
 
     @staticmethod
-    def parse_album_detail(html: str) -> Dict[str, Any]:
-        result: Dict[str, Any] = {}
+    def parse_album_detail(html: str) -> dict[str, Any]:
+        result: dict[str, Any] = {}
 
         og_image = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
         if og_image:
@@ -253,7 +253,7 @@ class DoubanPageParser:
         if pub_match:
             result["publisher"] = _unescape(pub_match.group(1)).strip()
 
-        tracklist: List[str] = []
+        tracklist: list[str] = []
         tracklist_section = re.search(r'<div[^>]+id="track_list"[^>]*>(.*?)</div>', html, re.DOTALL)
         if tracklist_section:
             tracks_raw = re.findall(r"<(?:li|td)[^>]*>([^<]+)", tracklist_section.group(1))
@@ -284,8 +284,8 @@ class DoubanPageParser:
         return result
 
     @staticmethod
-    def parse_artist_detail(html: str) -> Dict[str, Any]:
-        result: Dict[str, Any] = {}
+    def parse_artist_detail(html: str) -> dict[str, Any]:
+        result: dict[str, Any] = {}
 
         name_match = re.search(r"<title>(.*?)[\s\r\n]*[\(（]豆瓣[\)）]", html, re.DOTALL)
         if name_match:
@@ -317,7 +317,7 @@ class DoubanPageParser:
                     if og_desc:
                         result["description"] = _unescape(og_desc.group(1)).strip()
 
-        genres: List[str] = []
+        genres: list[str] = []
         tag_section = re.search(r'<div[^>]+class="[^"]*tags[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL)
         if tag_section:
             genres = [_unescape(t).strip() for t in re.findall(r"<a[^>]+>([^<]+)</a>", tag_section.group(1)) if t.strip()]
@@ -345,7 +345,8 @@ class DoubanMetadataProvider(MetadataProvider):
         self.throttler = ThrottlerManager(rate_limit=RATE_LIMIT, period=RATE_PERIOD)
         self.logger.info("[豆瓣元数据] 初始化完成（限流: %d req/%ds）", RATE_LIMIT, RATE_PERIOD)
 
-    async def get_artist_metadata(self, artist: Artist) -> Optional[MediaItemMetadata]:
+    async def get_artist_metadata(self, artist: Artist) -> MediaItemMetadata | None:
+        self.logger.debug("[豆瓣] get_artist_metadata 被调用: %s", artist.name)
         if not self.enable_artist_metadata:
             return None
 
@@ -365,7 +366,9 @@ class DoubanMetadataProvider(MetadataProvider):
         try:
             search_results = await self._search_douban(name)
             if not search_results:
+                self.logger.debug("[豆瓣] 搜索无结果: %s", name)
                 return None
+            self.logger.debug("[豆瓣] 搜索返回 %d 条结果: %s", len(search_results), name)
 
             best_artist_item = None
             for item in search_results:
@@ -467,7 +470,7 @@ class DoubanMetadataProvider(MetadataProvider):
                 metadata.description = "\n".join(desc_parts)
 
             if self.enable_images:
-                url_score_map: Dict[str, float] = {}
+                url_score_map: dict[str, float] = {}
                 seen_urls = set()
 
                 if not has_artist_photo and artist_cover_url and artist_cover_url not in seen_urls:
@@ -489,9 +492,10 @@ class DoubanMetadataProvider(MetadataProvider):
                 if all_candidates:
                     metadata.images = UniqueList()
                     for c_url in all_candidates:
-                        metadata.images.append(MediaItemImage(type=ImageType.THUMB, path=c_url, provider=self.instance_id, remotely_accessible=True))
+                        metadata.images.append(MediaItemImage(type=ImageType.THUMB, path=self._make_image_path(c_url), provider=self.instance_id, remotely_accessible=True))
 
             if metadata.description:
+                self.logger.debug("[豆瓣] 准备写入艺术家简介: %s (长度: %d)", name, len(metadata.description))
                 try:
                     if isinstance(artist, ItemMapping):
                         artist = self.mass.music.artists.artist_from_item_mapping(artist)
@@ -511,7 +515,7 @@ class DoubanMetadataProvider(MetadataProvider):
             self.logger.exception("[豆瓣元数据] 艺术家元数据获取失败: %s", name)
             return None
 
-    async def get_album_metadata(self, album: Album) -> Optional[MediaItemMetadata]:
+    async def get_album_metadata(self, album: Album) -> MediaItemMetadata | None:
         if not self.enable_album_metadata:
             return None
 
@@ -560,7 +564,7 @@ class DoubanMetadataProvider(MetadataProvider):
                 cover_url = best_item.get("cover_url")
                 if self.enable_images and cover_url:
                     metadata.images = UniqueList()
-                    metadata.images.append(MediaItemImage(type=ImageType.THUMB, path=cover_url, provider=self.instance_id, remotely_accessible=True))
+                    metadata.images.append(MediaItemImage(type=ImageType.THUMB, path=self._make_image_path(cover_url), provider=self.instance_id, remotely_accessible=True))
                 album.artists = original_artists
                 return metadata
 
@@ -594,7 +598,7 @@ class DoubanMetadataProvider(MetadataProvider):
             cover_url = detail.get("cover_url") or best_item.get("cover_url")
             if self.enable_images and cover_url:
                 metadata.images = UniqueList()
-                metadata.images.append(MediaItemImage(type=ImageType.THUMB, path=cover_url, provider=self.instance_id, remotely_accessible=True))
+                metadata.images.append(MediaItemImage(type=ImageType.THUMB, path=self._make_image_path(cover_url), provider=self.instance_id, remotely_accessible=True))
 
             if metadata.description:
                 try:
@@ -616,7 +620,7 @@ class DoubanMetadataProvider(MetadataProvider):
             album.artists = original_artists
             return None
 
-    async def get_track_metadata(self, track: Track) -> Optional[MediaItemMetadata]:
+    async def get_track_metadata(self, track: Track) -> MediaItemMetadata | None:
         if not self.enable_track_metadata:
             return None
 
@@ -640,7 +644,7 @@ class DoubanMetadataProvider(MetadataProvider):
             cover_url = detail.get("cover_url") if detail else best_item.get("cover_url")
             if self.enable_images and cover_url:
                 metadata.images = UniqueList()
-                metadata.images.append(MediaItemImage(type=ImageType.THUMB, path=cover_url, provider=self.instance_id, remotely_accessible=True))
+                metadata.images.append(MediaItemImage(type=ImageType.THUMB, path=self._make_image_path(cover_url), provider=self.instance_id, remotely_accessible=True))
 
             if detail and detail.get("genre"):
                 metadata.genres = {_unescape(detail["genre"])}
@@ -651,19 +655,27 @@ class DoubanMetadataProvider(MetadataProvider):
             self.logger.error("[豆瓣元数据] 曲目元数据获取失败: %s", search_query)
             return None
 
+    def _make_image_path(self, url: str) -> str:
+        """将豆瓣CDN URL编码为内部path，强制MA框架走resolve_image()而非裸HTTP下载。"""
+        return f"douban://{urllib.parse.quote(url, safe='')}"
+
     async def resolve_image(self, path: str) -> str | bytes:
-        if not path or "doubanio.com" not in path:
+        # 只处理豆瓣内部path（douban://...），其余原样返回
+        if not path.startswith("douban://"):
             return path
 
-        headers = {"User-Agent": BROWSER_USER_AGENT, "Referer": "https://music.douban.com/"}
-        candidate_urls = [path]
+        # 解码回真实URL
+        real_url = urllib.parse.unquote(path.replace("douban://", ""))
 
-        m = _IMG_DOMAIN_RE.match(path)
+        headers = {"User-Agent": BROWSER_USER_AGENT, "Referer": "https://music.douban.com/"}
+        candidate_urls = [real_url]
+
+        m = _IMG_DOMAIN_RE.match(real_url)
         if m:
             prefix, _, suffix, rest = m.groups()
             for n in (1, 2, 3, 5, 6, 7, 9):
                 alt = f"{prefix}img{n}{suffix}{rest}"
-                if alt != path:
+                if alt != real_url:
                     candidate_urls.append(alt)
 
         for try_url in candidate_urls:
@@ -678,12 +690,12 @@ class DoubanMetadataProvider(MetadataProvider):
             except Exception:
                 continue
 
-        self.logger.warning("[豆瓣元数据] 图片下载失败: %s", path)
+        self.logger.warning("[豆瓣元数据] 图片下载失败: %s", real_url)
         return path
 
     @use_cache(CACHE_TTL, persistent=True)
     @throttle_with_retries
-    async def _fetch_json(self, url: str) -> Optional[Any]:
+    async def _fetch_json(self, url: str) -> Any | None:
         headers = {
             "User-Agent": CRAWLER_USER_AGENT,
             "Accept": "application/json, text/javascript, */*",
@@ -709,7 +721,7 @@ class DoubanMetadataProvider(MetadataProvider):
 
     @use_cache(CACHE_TTL, persistent=True)
     @throttle_with_retries
-    async def _fetch_html(self, url: str) -> Optional[str]:
+    async def _fetch_html(self, url: str) -> str | None:
         headers = {
             "User-Agent": CRAWLER_USER_AGENT,
             "Accept": "text/html,application/xhtml+xml",
@@ -733,7 +745,7 @@ class DoubanMetadataProvider(MetadataProvider):
         except Exception:
             return None
 
-    async def _search_douban(self, keyword: str) -> List[Dict[str, Any]]:
+    async def _search_douban(self, keyword: str) -> list[dict[str, Any]]:
         items = await self._search_douban_full(keyword)
         if len(items) < 3:
             suggest_items = await self._search_suggest(keyword)
@@ -743,7 +755,7 @@ class DoubanMetadataProvider(MetadataProvider):
                     items.append(si)
         return items
 
-    async def _search_suggest(self, keyword: str) -> List[Dict[str, Any]]:
+    async def _search_suggest(self, keyword: str) -> list[dict[str, Any]]:
         encoded = urllib.parse.quote(keyword)
         url = f"{DOUBAN_SUGGEST_URL}?q={encoded}&cat=1003"
         data = await self._fetch_json(url)
@@ -781,7 +793,7 @@ class DoubanMetadataProvider(MetadataProvider):
             })
         return items
 
-    async def _search_douban_full(self, keyword: str) -> List[Dict[str, Any]]:
+    async def _search_douban_full(self, keyword: str) -> list[dict[str, Any]]:
         encoded = urllib.parse.quote(keyword)
         search_url = f"https://search.douban.com/music/subject_search?search_text={encoded}&cat=1003"
         html = await self._fetch_html(search_url)
@@ -877,12 +889,12 @@ class DoubanMetadataProvider(MetadataProvider):
                 })
         return items
 
-    async def _fetch_album_detail(self, subject_id: str) -> Optional[Dict[str, Any]]:
+    async def _fetch_album_detail(self, subject_id: str) -> dict[str, Any] | None:
         url = f"{DOUBAN_BASE_URL}/subject/{subject_id}/"
         html = await self._fetch_html(url)
         return DoubanPageParser.parse_album_detail(html) if html else None
 
-    async def _fetch_artist_detail(self, artist_id: str) -> Optional[Dict[str, Any]]:
+    async def _fetch_artist_detail(self, artist_id: str) -> dict[str, Any] | None:
         url = f"{DOUBAN_BASE_URL}/artist/{artist_id}/"
         html = await self._fetch_html(url)
         return DoubanPageParser.parse_artist_detail(html) if html else None
@@ -892,7 +904,7 @@ async def setup(mass: "MusicAssistant", manifest: "ProviderManifest", config: "P
     return DoubanMetadataProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
-async def get_config_entries(mass: "MusicAssistant", instance_id: Optional[str] = None, action: Optional[str] = None, values: Optional[Dict[str, "ConfigValueType"]] = None) -> tuple[ConfigEntry, ...]:
+async def get_config_entries(mass: "MusicAssistant", instance_id: str | None = None, action: str | None = None, values: dict[str, "ConfigValueType"] | None = None) -> tuple[ConfigEntry, ...]:
     return (
         ConfigEntry(
             key=ConfigKeys.ENABLE_ARTIST_METADATA,

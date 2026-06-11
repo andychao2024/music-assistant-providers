@@ -1,5 +1,5 @@
 """
-GD Studio Music Provider for Music Assistant v1.1.26
+GD Studio Music Provider for Music Assistant v1.1.27
 播放歌曲时自动获取LRC格式歌词（支持多音源）
 """
 from __future__ import annotations
@@ -9,7 +9,7 @@ import logging
 import time
 import struct
 import re
-from typing import TYPE_CHECKING, Dict, Optional, List, Tuple, Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from collections import defaultdict
 
 import aiohttp
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
-__version__ = "1.1.26"
+__version__ = "1.1.27"
 DOMAIN = "gd_studio_music"
 API_BASE_URL = "https://music-api.gdstudio.xyz/api.php"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
@@ -363,7 +363,7 @@ class GDStudioMusicProvider(MusicProvider):
             _LOGGER.error(error_msg)
             return [] if api_type == "search" else {}, error_msg
 
-    async def _fetch_pic_url(self, pic_id: str, source: str) -> Optional[str]:
+    async def _fetch_pic_url(self, pic_id: str, source: str) -> str | None:
         if not pic_id or pic_id == "unknown":
             return None
             
@@ -381,7 +381,7 @@ class GDStudioMusicProvider(MusicProvider):
         
         return None
 
-    async def _get_stream_url(self, track_id: str, initial_source: str) -> tuple[Optional[str], Optional[str], Optional[str], str]:
+    async def _get_stream_url(self, track_id: str, initial_source: str) -> tuple[str | None, str | None, str | None, str]:
         start_time = time.time()
         target_br = self._br_param
         cache_key = f"{track_id}_{target_br}"
@@ -561,7 +561,7 @@ class GDStudioMusicProvider(MusicProvider):
         res.tracks = tracks
         return res
 
-    async def get_track(self, prov_track_id: str, fallback_info: Optional[Dict] = None) -> Track:
+    async def get_track(self, prov_track_id: str, fallback_info: dict | None = None) -> Track:
         full_track_id = get_full_track_id(prov_track_id, self._default_source)
         
         if full_track_id in _track_cache:

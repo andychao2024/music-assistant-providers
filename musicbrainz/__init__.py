@@ -1,26 +1,25 @@
 """The Musicbrainz Metadata provider for Music Assistant.
 
 At this time only used for retrieval of ID's but to be expanded to fetch metadata too.
-
-Modified version: when MusicBrainz returns no match (common for Chinese/regional artists),
-deterministic placeholder UUIDs are generated using uuid5 so that downstream
-metadata providers (Douban, etc.) can still be triggered.
-No external API dependency required.
 """
 
 from __future__ import annotations
 
 import re
-import uuid
 from contextlib import suppress
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import TYPE_CHECKING, Any, cast
+from uuid import NAMESPACE_OID, uuid5
 
 from mashumaro import DataClassDictMixin
 from mashumaro.exceptions import MissingField
-from music_assistant_models.enums import ExternalID, ProviderFeature
-from music_assistant_models.errors import InvalidDataError, ResourceTemporarilyUnavailable
+from music_assistant_models.enums import ExternalID, LinkType, ProviderFeature
+from music_assistant_models.errors import (
+    InvalidDataError,
+    RateLimited,
+    ResourceTemporarilyUnavailable,
+)
+from music_assistant_models.media_items import MediaItemLink, MediaItemMetadata
 
 from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.compare import compare_strings
@@ -31,7 +30,7 @@ from music_assistant.models.metadata_provider import MetadataProvider
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigEntry, ConfigValueType, ProviderConfig
-    from music_assistant_models.media_items import Album, Track
+    from music_assistant_models.media_items import Album, Artist, Track
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
@@ -40,22 +39,92 @@ if TYPE_CHECKING:
 
 LUCENE_SPECIAL = r'([+\-&|!(){}\[\]\^"~*?:\\\/])'
 
-SUPPORTED_FEATURES: set[ProviderFeature] = (
-    set()
-)  # we don't have any special supported features (yet)
+SUPPORTED_FEATURES: set[ProviderFeature] = {ProviderFeature.ARTIST_METADATA}
 
-# Placeholder UUID namespace — deterministic so same artist always gets same UUID
-_PLACEHOLDER_NAMESPACE = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # NAMESPACE_OID
+# Mapping from MusicBrainz URL relation "type" slug to our LinkType enum.
+# See https://musicbrainz.org/relationships/artist-url for the full set.
+URL_RELATION_TYPE_MAPPING: dict[str, LinkType] = {
+    "wikipedia": LinkType.WIKIPEDIA,
+    "allmusic": LinkType.ALLMUSIC,
+    "last.fm": LinkType.LASTFM,
+    "official homepage": LinkType.WEBSITE,
+}
+
+# Social network relations use a single MB type but multiple destinations,
+# so we sniff the URL host to pick a more specific LinkType.
+SOCIAL_HOST_MAPPING: tuple[tuple[str, LinkType], ...] = (
+    ("facebook.com", LinkType.FACEBOOK),
+    ("instagram.com", LinkType.INSTAGRAM),
+    ("tiktok.com", LinkType.TIKTOK),
+    ("twitter.com", LinkType.TWITTER),
+    ("x.com", LinkType.TWITTER),
+)
 
 
-@lru_cache(maxsize=2000)
-def generate_placeholder_id(name: str) -> str:
-    """Generate a deterministic UUID5 placeholder ID.
+# =============================================================================
+# === FALLBACK helpers — placeholder UUID generation ==========================
+# =============================================================================
+# When MusicBrainz has no entry for an artist/album/track (common for
+# Chinese artists), the original code returns None / raises InvalidDataError,
+# which causes MA to skip ALL downstream metadata providers (douban, netease…).
+# We instead return deterministic placeholder objects so that downstream
+# providers are still invoked.
+#
+# UUID seed: uuid5(NAMESPACE_OID, "mbcn_{name}") — deterministic, cross-restart
+# consistent, and clearly separated from real MusicBrainz UUIDs by the prefix.
+# =============================================================================
 
-    Same input always produces the same UUID, ensuring MA's internal
-    cache remains consistent across restarts.
-    """
-    return str(uuid.uuid5(_PLACEHOLDER_NAMESPACE, f"mbcn_{name}"))
+def _placeholder_uuid(name: str) -> str:
+    """Return a deterministic placeholder UUID for a given name."""
+    return str(uuid5(NAMESPACE_OID, f"mbcn_{name}"))
+
+
+def _make_placeholder_artist(name: str) -> MusicBrainzArtist:
+    """Return a minimal placeholder MusicBrainzArtist for an unknown artist."""
+    uid = _placeholder_uuid(name)
+    # Pass all optional fields explicitly: DataClassDictMixin may not apply
+    # dataclass defaults when fields are omitted from the constructor call.
+    return MusicBrainzArtist(id=uid, name=name, sort_name=name, aliases=None, tags=None, relations=None)
+
+
+def _make_placeholder_recording(name: str) -> MusicBrainzRecording:
+    """Return a minimal placeholder MusicBrainzRecording for an unknown track."""
+    uid = _placeholder_uuid(name)
+    return MusicBrainzRecording(id=uid, title=name, artist_credit=[], length=None, first_release_date=None, isrcs=None, tags=None, disambiguation=None)
+
+
+def _make_placeholder_release(name: str) -> MusicBrainzRelease:
+    """Return a minimal placeholder MusicBrainzRelease for an unknown album."""
+    uid = _placeholder_uuid(name)
+    rg = MusicBrainzReleaseGroup(id=uid, title=name)
+    artist = _make_placeholder_artist("unknown")
+    credit = MusicBrainzArtistCredit(name="unknown", artist=artist)
+    return MusicBrainzRelease(
+        id=uid,
+        status_id="",
+        count=0,
+        title=name,
+        status="",
+        artist_credit=[credit],
+        release_group=rg,
+    )
+
+
+def _make_placeholder_release_group(name: str) -> MusicBrainzReleaseGroup:
+    """Return a minimal placeholder MusicBrainzReleaseGroup for an unknown album."""
+    uid = _placeholder_uuid(name)
+    return MusicBrainzReleaseGroup(id=uid, title=name)
+
+
+def _make_placeholder_result(
+    artistname: str, albumname: str, trackname: str
+) -> tuple[MusicBrainzArtist, MusicBrainzReleaseGroup, MusicBrainzRecording]:
+    """Return a placeholder search result tuple so downstream providers are triggered."""
+    return (
+        _make_placeholder_artist(artistname),
+        _make_placeholder_release_group(albumname),
+        _make_placeholder_recording(trackname),
+    )
 
 
 async def setup(
@@ -119,6 +188,23 @@ class MusicBrainzAlias(DataClassDictMixin):
 
 
 @dataclass
+class MusicBrainzUrl(DataClassDictMixin):
+    """Model for a Url object embedded in a MusicBrainz relation."""
+
+    resource: str
+
+
+@dataclass
+class MusicBrainzRelation(DataClassDictMixin):
+    """Model for a Relation object from MusicBrainz."""
+
+    type: str
+
+    # optional - only populated on url-rels (work-rels and friends have other targets)
+    url: MusicBrainzUrl | None = None
+
+
+@dataclass
 class MusicBrainzArtist(DataClassDictMixin):
     """Model for a (basic) Artist object from MusicBrainz."""
 
@@ -129,13 +215,24 @@ class MusicBrainzArtist(DataClassDictMixin):
     # optional fields
     aliases: list[MusicBrainzAlias] | None = None
     tags: list[MusicBrainzTag] | None = None
+    relations: list[MusicBrainzRelation] | None = None
 
     @classmethod
     def from_raw(cls, data: Any) -> MusicBrainzArtist:
-        """Instantiate object from raw api data."""
+        """Instantiate object from raw api data.
+
+        We pre-seed *all* optional keys with ``None`` before calling
+        ``from_dict`` so that mashumaro always sets the corresponding
+        attributes — even when the key is absent from the API response.
+        (Mashumaro may otherwise skip the attribute entirely, leading to
+        ``AttributeError`` on later access.)
+        """
         alt_data = replace_hyphens(data)
         if TYPE_CHECKING:
             alt_data = cast("dict[str, Any]", alt_data)
+        # Pre-fill every optional key so from_dict always sets the attribute.
+        for _key in ("aliases", "tags", "relations"):
+            alt_data.setdefault(_key, None)
         return MusicBrainzArtist.from_dict(alt_data)
 
 
@@ -164,10 +261,19 @@ class MusicBrainzReleaseGroup(DataClassDictMixin):
 
     @classmethod
     def from_raw(cls, data: Any) -> MusicBrainzReleaseGroup:
-        """Instantiate object from raw api data."""
+        """Instantiate object from raw api data.
+
+        Pre-fill optional keys so mashumaro always sets the attributes.
+        """
         alt_data = replace_hyphens(data)
         if TYPE_CHECKING:
             alt_data = cast("dict[str, Any]", alt_data)
+        for _key in (
+            "primary_type", "primary_type_id",
+            "secondary_types", "secondary_type_ids",
+            "artist_credit", "barcode",
+        ):
+            alt_data.setdefault(_key, None)
         return MusicBrainzReleaseGroup.from_dict(alt_data)
 
 
@@ -182,10 +288,14 @@ class MusicBrainzTrack(DataClassDictMixin):
 
     @classmethod
     def from_raw(cls, data: Any) -> MusicBrainzTrack:
-        """Instantiate object from raw api data."""
+        """Instantiate object from raw api data.
+
+        Pre-fill optional keys so mashumaro always sets the attributes.
+        """
         alt_data = replace_hyphens(data)
         if TYPE_CHECKING:
             alt_data = cast("dict[str, Any]", alt_data)
+        alt_data.setdefault("length", None)
         return MusicBrainzTrack.from_dict(alt_data)
 
 
@@ -222,10 +332,15 @@ class MusicBrainzRelease(DataClassDictMixin):
 
     @classmethod
     def from_raw(cls, data: Any) -> MusicBrainzRelease:
-        """Instantiate object from raw api data."""
+        """Instantiate object from raw api data.
+
+        Pre-fill optional keys so mashumaro always sets the attributes.
+        """
         alt_data = replace_hyphens(data)
         if TYPE_CHECKING:
             alt_data = cast("dict[str, Any]", alt_data)
+        for _key in ("media", "date", "country", "disambiguation"):
+            alt_data.setdefault(_key, None)
         return MusicBrainzRelease.from_dict(alt_data)
 
 
@@ -245,21 +360,27 @@ class MusicBrainzRecording(DataClassDictMixin):
 
     @classmethod
     def from_raw(cls, data: Any) -> MusicBrainzRecording:
-        """Instantiate object from raw api data."""
+        """Instantiate object from raw api data.
+
+        Pre-seed all optional keys so mashumaro always sets the attributes.
+        """
         alt_data = replace_hyphens(data)
         if TYPE_CHECKING:
             alt_data = cast("dict[str, Any]", alt_data)
+        for _key in ("length", "first_release_date", "isrcs", "tags", "disambiguation"):
+            alt_data.setdefault(_key, None)
         return MusicBrainzRecording.from_dict(alt_data)
 
 
 class MusicbrainzProvider(MetadataProvider):
     """The Musicbrainz Metadata provider."""
 
-    throttler = ThrottlerManager(rate_limit=5, period=1)
+    throttler = ThrottlerManager(rate_limit=10, period=10)
 
     async def handle_async_init(self) -> None:
         """Handle async initialization of the provider."""
         self.cache = self.mass.cache
+        self.logger.info("musicbrainz魔改版 已加载（含占位符兜底，中文搜索无结果时触发下游 metadata provider）")
 
     async def search(
         self, artistname: str, albumname: str, trackname: str, trackversion: str | None = None
@@ -325,49 +446,16 @@ class MusicbrainzProvider(MetadataProvider):
                     return (artist_match, album_match, recording)
 
         # === FALLBACK ===
-        # Official provider returns None here, which prevents downstream
-        # metadata providers from being triggered. We generate placeholder
-        # UUIDs instead, so Douban etc. can still enrich the artist/album.
+        # MusicBrainz has no entry for this track (common for Chinese artists).
+        # Return a placeholder result so downstream metadata providers
+        # (douban, netease…) are still invoked by MA instead of being skipped.
         self.logger.debug(
-            "No MusicBrainz match for '%s' / '%s' / '%s', "
-            "generating placeholder UUIDs to trigger downstream providers",
-            artistname, albumname, trackname,
+            "MusicBrainz: no match for '%s / %s / %s' — returning placeholder",
+            artistname,
+            albumname,
+            trackname,
         )
-        return self._make_placeholder_result(artistname, albumname, trackname, trackversion)
-
-    def _make_placeholder_result(
-        self,
-        artistname: str,
-        albumname: str,
-        trackname: str,
-        trackversion: str | None = None,
-    ) -> tuple[MusicBrainzArtist, MusicBrainzReleaseGroup, MusicBrainzRecording]:
-        """Generate a deterministic placeholder result when MusicBrainz has no match.
-
-        Uses uuid5 so the same artist always gets the same UUID across restarts,
-        which keeps MA's internal cache consistent.
-        """
-        artist_id = generate_placeholder_id(artistname)
-        album_id = generate_placeholder_id(f"{artistname}_{albumname}")
-        track_id = generate_placeholder_id(f"{artistname}_{albumname}_{trackname}")
-
-        artist = MusicBrainzArtist(
-            id=artist_id,
-            name=artistname,
-            sort_name=artistname,
-        )
-        release_group = MusicBrainzReleaseGroup(
-            id=album_id,
-            title=albumname,
-            artist_credit=[MusicBrainzArtistCredit(name=artistname, artist=artist)],
-        )
-        recording = MusicBrainzRecording(
-            id=track_id,
-            title=trackname,
-            artist_credit=[MusicBrainzArtistCredit(name=artistname, artist=artist)],
-            disambiguation=trackversion,
-        )
-        return (artist, release_group, recording)
+        return _make_placeholder_result(artistname, albumname, trackname)
 
     async def get_artist_details(self, artist_id: str) -> MusicBrainzArtist:
         """Get (full) Artist details by providing a MusicBrainz artist id."""
@@ -377,24 +465,78 @@ class MusicbrainzProvider(MetadataProvider):
         if result := await self.get_data(endpoint):
             if "id" not in result:
                 result["id"] = artist_id
-            # TODO: Parse all the optional data like relations and such
             try:
                 return MusicBrainzArtist.from_raw(result)
             except MissingField as err:
                 raise InvalidDataError from err
         # === FALLBACK ===
-        self.logger.debug(
-            "Artist ID '%s' not found in MusicBrainz, returning placeholder", artist_id
-        )
-        return MusicBrainzArtist(
-            id=artist_id,
-            name=f"Artist_{artist_id[:8]}",
-            sort_name=f"Artist_{artist_id[:8]}",
-        )
+        # Placeholder UUIDs are not in the MB database; return a stub so callers
+        # that depend on get_artist_details don't crash on InvalidDataError.
+        self.logger.debug("MusicBrainz: artist ID '%s' not found — returning placeholder", artist_id)
+        return MusicBrainzArtist(id=artist_id, name=artist_id, sort_name=artist_id, aliases=None, tags=None, relations=None)
+
+    async def resolve_artists_from_mbids(
+        self, mbids: tuple[str, ...]
+    ) -> list[tuple[str, str, str] | None]:
+        """
+        Look up canonical artist names for a sequence of MusicBrainz artist IDs.
+
+        Transient failures (MusicBrainz unreachable, retries exhausted) are left
+        to propagate so the caller can retry later rather than persist degraded
+        data; only a genuinely unresolvable MBID yields ``None``.
+
+        :param mbids: MusicBrainz artist IDs to look up.
+        :return: One entry per input MBID, in the same order, as a
+            ``(name, mbid, sort_name)`` tuple. ``None`` at a position means
+            that MBID could not be resolved.
+        """
+        results: list[tuple[str, str, str] | None] = []
+        for mbid in mbids:
+            try:
+                artist = await self.get_artist_details(mbid)
+                results.append((artist.name, mbid, artist.sort_name))
+            except InvalidDataError as err:
+                self.logger.warning("Failed to lookup MusicBrainz artist %s: %s", mbid, err)
+                results.append(None)
+        return results
+
+    async def get_artist_metadata(self, artist: Artist) -> MediaItemMetadata | None:
+        """Surface MusicBrainz URL relations (Wikipedia, official site, socials, ...)."""
+        if not artist.mbid:
+            return None
+        try:
+            details = await self.get_artist_details(artist.mbid)
+        except InvalidDataError:
+            return None
+        # Use getattr as a safety net: mashumaro's from_dict may skip optional
+        # fields that are absent in the API response rather than setting them to
+        # their declared default value (None).
+        if not getattr(details, "relations", None):
+            return None
+        links: set[MediaItemLink] = set()
+        for relation in details.relations:
+            if not relation.url:
+                continue
+            if link_type := self._link_type_for_relation(relation):
+                links.add(MediaItemLink(type=link_type, url=relation.url.resource))
+        if not links:
+            return None
+        return MediaItemMetadata(links=links)
+
+    @staticmethod
+    def _link_type_for_relation(relation: MusicBrainzRelation) -> LinkType | None:
+        if link_type := URL_RELATION_TYPE_MAPPING.get(relation.type):
+            return link_type
+        if relation.type == "social network" and relation.url:
+            url_lower = relation.url.resource.lower()
+            for host, link_type in SOCIAL_HOST_MAPPING:
+                if host in url_lower:
+                    return link_type
+        return None
 
     async def get_recording_details(self, recording_id: str) -> MusicBrainzRecording:
         """Get Recording details by providing a MusicBrainz Recording Id."""
-        if result := await self.get_data(f"recording/{recording_id}?inc=artists+releases"):
+        if result := await self.get_data(f"recording/{recording_id}?inc=artists+releases+isrcs"):
             if "id" not in result:
                 result["id"] = recording_id
             try:
@@ -403,18 +545,21 @@ class MusicbrainzProvider(MetadataProvider):
                 raise InvalidDataError from err
         # === FALLBACK ===
         self.logger.debug(
-            "Recording ID '%s' not found in MusicBrainz, returning placeholder", recording_id
+            "MusicBrainz: recording ID '%s' not found — returning placeholder", recording_id
         )
-        artist = MusicBrainzArtist(
-            id=generate_placeholder_id("unknown_artist"),
-            name="Unknown Artist",
-            sort_name="Unknown Artist",
-        )
-        return MusicBrainzRecording(
-            id=recording_id,
-            title=f"Track_{recording_id[:8]}",
-            artist_credit=[MusicBrainzArtistCredit(name="Unknown Artist", artist=artist)],
-        )
+        return MusicBrainzRecording(id=recording_id, title=recording_id, artist_credit=[], length=None, first_release_date=None, isrcs=None, tags=None, disambiguation=None)
+
+    async def get_isrcs_for_recording(self, recording_id: str) -> list[str]:
+        """
+        Get ISRCs for a MusicBrainz Recording ID.
+
+        :param recording_id: MusicBrainz recording ID.
+        :return: List of ISRCs, or empty list if not found or on error.
+        """
+        with suppress(InvalidDataError):
+            recording = await self.get_recording_details(recording_id)
+            return recording.isrcs or []
+        return []
 
     async def get_release_details(self, album_id: str) -> MusicBrainzRelease:
         """Get Release/Album details by providing a MusicBrainz Album id."""
@@ -428,28 +573,9 @@ class MusicbrainzProvider(MetadataProvider):
                 raise InvalidDataError from err
         # === FALLBACK ===
         self.logger.debug(
-            "Release ID '%s' not found in MusicBrainz, returning placeholder", album_id
+            "MusicBrainz: release ID '%s' not found — returning placeholder", album_id
         )
-        artist = MusicBrainzArtist(
-            id=generate_placeholder_id("unknown_artist"),
-            name="Unknown Artist",
-            sort_name="Unknown Artist",
-        )
-        release_group = MusicBrainzReleaseGroup(
-            id=album_id,
-            title=f"Album_{album_id[:8]}",
-            artist_credit=[MusicBrainzArtistCredit(name="Unknown Artist", artist=artist)],
-        )
-        return MusicBrainzRelease(
-            id=album_id,
-            status_id="official",
-            count=0,
-            title=f"Album_{album_id[:8]}",
-            status="Official",
-            artist_credit=[MusicBrainzArtistCredit(name="Unknown Artist", artist=artist)],
-            release_group=release_group,
-            track_count=0,
-        )
+        return _make_placeholder_release(album_id)
 
     async def get_releasegroup_details(self, releasegroup_id: str) -> MusicBrainzReleaseGroup:
         """Get ReleaseGroup details by providing a MusicBrainz ReleaseGroup id."""
@@ -463,18 +589,9 @@ class MusicbrainzProvider(MetadataProvider):
                 raise InvalidDataError from err
         # === FALLBACK ===
         self.logger.debug(
-            "ReleaseGroup ID '%s' not found in MusicBrainz, returning placeholder", releasegroup_id
+            "MusicBrainz: release-group ID '%s' not found — returning placeholder", releasegroup_id
         )
-        artist = MusicBrainzArtist(
-            id=generate_placeholder_id("unknown_artist"),
-            name="Unknown Artist",
-            sort_name="Unknown Artist",
-        )
-        return MusicBrainzReleaseGroup(
-            id=releasegroup_id,
-            title=f"Album_{releasegroup_id[:8]}",
-            artist_credit=[MusicBrainzArtistCredit(name="Unknown Artist", artist=artist)],
-        )
+        return MusicBrainzReleaseGroup(id=releasegroup_id, title=releasegroup_id, primary_type=None, primary_type_id=None, secondary_types=None, secondary_type_ids=None, artist_credit=None, barcode=None)
 
     async def get_artist_details_by_album(
         self, artistname: str, ref_album: Album
@@ -493,41 +610,34 @@ class MusicbrainzProvider(MetadataProvider):
                 result = await self.get_release_details(mb_id)
         else:
             # === FALLBACK ===
+            # No MB ID at all — return a placeholder so downstream providers fire.
             self.logger.debug(
-                "Album '%s' has no MB IDs, returning placeholder artist for '%s'",
-                ref_album.name, artistname,
+                "MusicBrainz: no MB ID for album '%s' (artist '%s') — returning placeholder",
+                ref_album.name,
+                artistname,
             )
-            return MusicBrainzArtist(
-                id=generate_placeholder_id(artistname),
-                name=artistname,
-                sort_name=artistname,
-            )
+            return _make_placeholder_artist(artistname)
         if not (result and result.artist_credit):
             # === FALLBACK ===
             self.logger.debug(
-                "No artist_credit in release for '%s', returning placeholder", artistname
+                "MusicBrainz: no artist_credit for album '%s' (artist '%s') — returning placeholder",
+                ref_album.name,
+                artistname,
             )
-            return MusicBrainzArtist(
-                id=generate_placeholder_id(artistname),
-                name=artistname,
-                sort_name=artistname,
-            )
+            return _make_placeholder_artist(artistname)
         for strict in (True, False):
             for artist_credit in result.artist_credit:
                 if compare_strings(artist_credit.artist.name, artistname, strict):
                     return artist_credit.artist
-                for alias in artist_credit.artist.aliases or []:
+                for alias in (getattr(artist_credit.artist, "aliases", None) or []):
                     if compare_strings(alias.name, artistname, strict):
                         return artist_credit.artist
         # === FALLBACK ===
         self.logger.debug(
-            "Artist '%s' not found in credits, returning placeholder", artistname
+            "MusicBrainz: artist '%s' not matched in album credits — returning placeholder",
+            artistname,
         )
-        return MusicBrainzArtist(
-            id=generate_placeholder_id(artistname),
-            name=artistname,
-            sort_name=artistname,
-        )
+        return _make_placeholder_artist(artistname)
 
     async def get_artist_details_by_track(
         self, artistname: str, ref_track: Track
@@ -540,27 +650,22 @@ class MusicbrainzProvider(MetadataProvider):
         if not ref_track.mbid:
             # === FALLBACK ===
             self.logger.debug(
-                "Track '%s' has no mbid, returning placeholder artist for '%s'",
-                ref_track.name, artistname,
+                "MusicBrainz: no mbid for track '%s' (artist '%s') — returning placeholder",
+                ref_track.name,
+                artistname,
             )
-            return MusicBrainzArtist(
-                id=generate_placeholder_id(artistname),
-                name=artistname,
-                sort_name=artistname,
-            )
+            return _make_placeholder_artist(artistname)
         result = None
         with suppress(InvalidDataError):
             result = await self.get_recording_details(ref_track.mbid)
         if not (result and result.artist_credit):
             # === FALLBACK ===
             self.logger.debug(
-                "No artist_credit in recording for '%s', returning placeholder", artistname
+                "MusicBrainz: no artist_credit for track '%s' (artist '%s') — returning placeholder",
+                ref_track.name,
+                artistname,
             )
-            return MusicBrainzArtist(
-                id=generate_placeholder_id(artistname),
-                name=artistname,
-                sort_name=artistname,
-            )
+            return _make_placeholder_artist(artistname)
         for strict in (True, False):
             for artist_credit in result.artist_credit:
                 if compare_strings(artist_credit.artist.name, artistname, strict):
@@ -570,13 +675,10 @@ class MusicbrainzProvider(MetadataProvider):
                         return artist_credit.artist
         # === FALLBACK ===
         self.logger.debug(
-            "Artist '%s' not found in recording credits, returning placeholder", artistname
+            "MusicBrainz: artist '%s' not matched in track credits — returning placeholder",
+            artistname,
         )
-        return MusicBrainzArtist(
-            id=generate_placeholder_id(artistname),
-            name=artistname,
-            sort_name=artistname,
-        )
+        return _make_placeholder_artist(artistname)
 
     async def get_artist_details_by_resource_url(
         self, resource_url: str
@@ -615,15 +717,11 @@ class MusicbrainzProvider(MetadataProvider):
         if not result or "recordings" not in result:
             # === FALLBACK ===
             self.logger.debug(
-                "No recordings found for '%s' / '%s', returning placeholder",
-                artist_name, track_name,
+                "MusicBrainz: no recordings found for '%s / %s' — returning placeholder",
+                artist_name,
+                track_name,
             )
-            artist = MusicBrainzArtist(
-                id=generate_placeholder_id(artist_name),
-                name=artist_name,
-                sort_name=artist_name,
-            )
-            return (artist, [])
+            return (_make_placeholder_artist(artist_name), [])
 
         # Collect all matching recordings with their artist and first-release-date
         matches: list[tuple[dict[str, Any], dict[str, Any], str]] = []
@@ -649,15 +747,11 @@ class MusicbrainzProvider(MetadataProvider):
         if not matches:
             # === FALLBACK ===
             self.logger.debug(
-                "No matching recordings for '%s' / '%s', returning placeholder",
-                artist_name, track_name,
+                "MusicBrainz: no artist match for '%s / %s' — returning placeholder",
+                artist_name,
+                track_name,
             )
-            artist = MusicBrainzArtist(
-                id=generate_placeholder_id(artist_name),
-                name=artist_name,
-                sort_name=artist_name,
-            )
-            return (artist, [])
+            return (_make_placeholder_artist(artist_name), [])
 
         # Sort by first-release-date to find the earliest (likely original studio recording)
         matches.sort(key=lambda x: x[2] if x[2] else "9999")
@@ -772,7 +866,7 @@ class MusicbrainzProvider(MetadataProvider):
             # handle rate limiter
             if response.status == 429:
                 backoff_time = int(response.headers.get("Retry-After", 0))
-                raise ResourceTemporarilyUnavailable("Rate Limiter", backoff_time=backoff_time)
+                raise RateLimited("Rate Limiter", backoff_time=backoff_time)
             # handle temporary server error
             if response.status in (502, 503):
                 raise ResourceTemporarilyUnavailable(backoff_time=30)
