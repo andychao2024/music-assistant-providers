@@ -1,7 +1,14 @@
 #### 📖介绍
 
 ### 适合国人使用 Music Assistant 最强插件，支持歌手（简介）、专辑、图片、歌词自动补全 
+##### 2026.6.11 更新支持 Music assistant 2.9.X
+- Music assistant 已采用 pythone 3.14 更新代码
+- 最新 compose 映射路径
+- musicbrainz 2.9.x魔改版最小改动
+- douban_metadata、netease_metadata 优化代码
 
+
+![更新支持 MA2.9.X](screenshot/MA29x.png)
 ##### 2026.4.20 新增支持豆瓣元数据
 
 ![豆瓣歌手](screenshot/duoban_artists.png)
@@ -44,11 +51,11 @@ services:
     # 网络模式必须设置为host，Music Assistant才能正常工作
     network_mode: host
     volumes:
-      - ./providers/netease_metadata:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_metadata  # 网易元数据
-      - ./providers/musicbrainz:/app/venv/lib/python3.13/site-packages/music_assistant/providers/musicbrainz  # musicbrainz魔改版
-      - ./providers/netease_lyrics:/app/venv/lib/python3.13/site-packages/music_assistant/providers/netease_lyrics  # netease_lyrics
-      - ./providers/gd_studio_music:/app/venv/lib/python3.13/site-packages/music_assistant/providers/gd_studio_music # GD_Studio_music
-      - ./providers/douban_metadata:/app/venv/lib/python3.13/site-packages/music_assistant/providers/douban_metadata # 豆瓣元数据
+      - ./providers/netease_metadata:/app/venv/lib/python3.14/site-packages/music_assistant/providers/netease_metadata  # 网易元数据
+      - ./providers/musicbrainz:/app/venv/lib/python3.14/site-packages/music_assistant/providers/musicbrainz  # musicbrainz魔改版
+      - ./providers/netease_lyrics:/app/venv/lib/python3.14/site-packages/music_assistant/providers/netease_lyrics  # netease_lyrics
+      - ./providers/gd_studio_music:/app/venv/lib/python3.14/site-packages/music_assistant/providers/gd_studio_music # GD_Studio_music
+      - ./providers/douban_metadata:/app/venv/lib/python3.14/site-packages/music_assistant/providers/douban_metadata # 豆瓣元数据
       - ./data:/data #数据持久化
       - /你的音乐存放目录:/music  #挂载本地音乐目录
     cap_add:
