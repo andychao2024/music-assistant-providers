@@ -1,13 +1,19 @@
 #### 📖介绍
 
 ### 适合国人使用 Music Assistant 最强插件，支持歌手（简介）、专辑、图片、歌词自动补全 
+
+##### 2026.7.31 新增支持箭头音乐APP Subsonic 连接桥接器
+- 已测试支持音源 QQ音乐、网易云音乐、MA本地音乐
+- 其它音源播放不了欢迎反馈
+
+![新增箭头音乐APP](screenshot/amcfy_music.png)
+
 ##### 2026.6.11 更新支持 Music assistant 2.9.X
 - Music assistant 已采用 pythone 3.14 更新代码
 - 最新 compose 映射路径
 - musicbrainz 2.9.x魔改版最小改动
 - douban_metadata、netease_metadata 优化代码
-
-
+  
 ![更新支持 MA2.9.X](screenshot/MA29x.png)
 ##### 2026.4.20 新增支持豆瓣元数据
 
@@ -30,6 +36,7 @@
 
 ```
 main/
+├── amcfy_music/    #箭头音乐APP桥接器
 ├── gd_studio_music/    #GD音乐源
 ├── musicbrainz/    #魔改版
 ├── douban_metadata/ #豆瓣元数据
