@@ -63,6 +63,7 @@ services:
       - ./providers/netease_lyrics:/app/venv/lib/python3.14/site-packages/music_assistant/providers/netease_lyrics  # netease_lyrics
       - ./providers/gd_studio_music:/app/venv/lib/python3.14/site-packages/music_assistant/providers/gd_studio_music # GD_Studio_music
       - ./providers/douban_metadata:/app/venv/lib/python3.14/site-packages/music_assistant/providers/douban_metadata # 豆瓣元数据
+      - ./providers/amcfy_music:/app/venv/lib/python3.14/site-packages/music_assistant/providers/amcfy_music  #箭头音乐APP桥接器
       - ./data:/data #数据持久化
       - /你的音乐存放目录:/music  #挂载本地音乐目录
     cap_add:
