@@ -3,6 +3,7 @@ Amcfy Music Subsonic Bridge Plugin for Music Assistant.
 
 Subsonic API bridge for Amcfy Music client - browse and stream all MA music
 sources (local files, Spotify, Tidal, NetEase, etc.) via Subsonic protocol.
+v1.0.2
 """
 
 from __future__ import annotations
@@ -304,24 +305,59 @@ async def setup(
     return AmcfyBridgePlugin(mass, manifest, config)
 
 
+def _get_raw_config_value(mass, instance_id: str, key: str, default: str = "") -> str:
+    """Read a raw stored provider config value across MA 2.9.x / 2.10.x."""
+    try:
+        raw = mass.config.get_raw_provider_config_value(instance_id, key, default=None)
+        if raw is None:
+            raw = mass.config.get(f"providers/{instance_id}/values/{key}", default)
+        return str(raw) if raw else default
+    except Exception:
+        return default
+
+
+def _persist_token(mass, instance_id: str, token: str) -> None:
+    """Persist a new token and sync the running provider instance."""
+    try:
+        setter = getattr(mass.config, "set_raw_provider_config_value", None)
+        if setter is not None:
+            setter(instance_id, CONF_TOKEN, token)
+        else:
+            mass.config.set(f"providers/{instance_id}/values/{CONF_TOKEN}", token)
+    except Exception:
+        pass
+    try:
+        provider = mass.get_provider(instance_id)
+        if provider is not None:
+            provider._api_token = token
+    except Exception:
+        pass
+
+
 async def get_config_entries(
     mass: MusicAssistant | None = None,
     instance_id: str | None = None,
     action: str | None = None,
     values: dict[str, ConfigValueType] | None = None,
 ) -> tuple[ConfigEntry, ...]:
+    token = ""
+    if instance_id and mass is not None:
+        token = _get_raw_config_value(mass, instance_id, CONF_TOKEN)
     if action == "regenerate_token":
         new_token = secrets.token_hex(16)
-        return (
-            ConfigEntry(
-                key=CONF_TOKEN,
-                type=ConfigEntryType.STRING,
-                label="API Token",
-                description="Token for Subsonic auth (p=xxx or t=md5(token+salt)&s=salt).",
-                required=True,
-                value=new_token,
-            ),
-        )
+        if instance_id and mass is not None:
+            _persist_token(mass, instance_id, new_token)
+        token = new_token
+    if not token:
+        token = secrets.token_hex(16)
+
+    search_scope = ""
+    if values and values.get(CONF_SEARCH_SCOPE):
+        search_scope = str(values[CONF_SEARCH_SCOPE])
+    elif instance_id and mass is not None:
+        search_scope = _get_raw_config_value(mass, instance_id, CONF_SEARCH_SCOPE)
+    if not search_scope:
+        search_scope = "library"
 
     return (
         ConfigEntry(
@@ -330,7 +366,7 @@ async def get_config_entries(
             label="API Token",
             description="Token for Subsonic auth (p=xxx or t=md5(token+salt)&s=salt).",
             required=True,
-            value=secrets.token_hex(16),
+            value=token,
         ),
         ConfigEntry(
             key="regenerate_token",
@@ -347,9 +383,10 @@ async def get_config_entries(
             description="搜索范围: 本地曲库(Library only) / 全部曲库(All sources including online)",
             default_value="library",
             required=True,
+            value=search_scope,
             options=[
-                ConfigValueOption("library", title="本地曲库 (Library only)"),
-                ConfigValueOption("all", title="全部曲库 (All sources including online)"),
+                ConfigValueOption(value="library", title="本地曲库 (Library only)"),
+                ConfigValueOption(value="all", title="全部曲库 (All sources including online)"),
             ],
         ),
     )
@@ -375,13 +412,8 @@ class AmcfyBridgePlugin(PluginProvider):
         self._api_token = self.config.get_value(CONF_TOKEN) or ""
         if not self._api_token:
             self._api_token = secrets.token_hex(16)
-            try:
-                await self.mass.config.set_raw_provider_config_value(
-                    self.instance_id, self.domain, CONF_TOKEN, self._api_token
-                )
-                self.logger.info("Generated new API token: %s", self._api_token)
-            except Exception:
-                self.logger.warning("Could not persist generated token")
+            _persist_token(self.mass, self.instance_id, self._api_token)
+            self.logger.info("Generated new API token: %s", self._api_token)
         for path in ("/rest/*", "/rest/rest/*", "//rest/*"):
             cb = self.mass.webserver.register_dynamic_route(
                 path, self._handle_request, "*"

@@ -2,7 +2,7 @@
   "type": "plugin",
   "domain": "amcfy_music",
   "stage": "alpha",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "name": "Amcfy Music Subsonic Bridge",
   "description": "Subsonic API bridge for Amcfy Music client - browse and stream all MA music sources via Subsonic protocol https://www.amcfy.com/download",
   "codeowners": ["@andychao2024"],
