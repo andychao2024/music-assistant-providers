@@ -3,7 +3,7 @@ Amcfy Music Subsonic Bridge Plugin for Music Assistant.
 
 Subsonic API bridge for Amcfy Music client - browse and stream all MA music
 sources (local files, Spotify, Tidal, NetEase, etc.) via Subsonic protocol.
-v1.0.2
+v1.0.5
 """
 
 from __future__ import annotations
@@ -250,6 +250,7 @@ def _song_dict(track: Track) -> dict:
         "discNumber": track.disc_number or 0,
         "type": "music",
         "created": _format_timestamp(track.date_added),
+        "played": _format_timestamp(track.last_played) if getattr(track, "last_played", None) else None,
         "starred": _format_timestamp(track.date_added) if track.favorite else None,
         "albumId": album.uri if album else "",
         "artistId": artist.uri if artist else "",
@@ -270,6 +271,7 @@ def _album_dict(album: Album, track_count: int = 0, duration: int = 0) -> dict:
         "songCount": track_count,
         "duration": duration,
         "created": _format_timestamp(album.date_added),
+        "played": _format_timestamp(album.last_played) if getattr(album, "last_played", None) else None,
         "year": album.year or 0,
         "genre": next(iter(genres), "") if genres else "",
         "starred": _format_timestamp(album.date_added) if album.favorite else None,
@@ -744,7 +746,7 @@ class AmcfyBridgePlugin(PluginProvider):
         elif atype == "recent":
             all_albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX)
             all_albums.sort(key=lambda a: getattr(a, "last_played", 0) or 0, reverse=True)
-            albums = all_albums
+            albums = [a for a in all_albums if getattr(a, "last_played", 0)]
         elif atype == "starred":
             albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX, favorite=True)
         elif atype == "random":
@@ -792,6 +794,25 @@ class AmcfyBridgePlugin(PluginProvider):
     async def handle_search3(self, request: web.Request, params: dict[str, str]) -> web.Response:
         return await self._handle_search(request, params, "search3")
 
+    def _resolve_search_order(self, order: str, by: str) -> str:
+        """Map Navidrome-style search order/by params to MA order_by values."""
+        order = (order or "name").lower()
+        desc = (by or "ASC").upper() == "DESC"
+        base = {
+            "playdate": "last_played",
+            "played": "last_played",
+            "playcount": "play_count",
+            "created": "timestamp_added",
+            "name": "sort_name",
+            "album": "sort_name",
+            "artist": "artist_name",
+            "year": "year",
+            "random": "random",
+        }.get(order, "sort_name")
+        if base == "random":
+            return "random"
+        return f"{base}_desc" if desc else base
+
     async def _handle_search(self, request: web.Request, params: dict[str, str], search_type: str) -> web.Response:
         query = params.get("query", "")
         artist_count = int(params.get("artistcount", "20"))
@@ -802,8 +823,11 @@ class AmcfyBridgePlugin(PluginProvider):
         song_offset = int(params.get("songoffset", "0"))
 
         if not query:
-            recent = await self.mass.music.tracks.library_items(limit=song_count)
-            songs = [_song_dict(t) for t in recent if isinstance(t, Track)]
+            order_by = self._resolve_search_order(params.get("order", ""), params.get("by", "ASC"))
+            tracks = await self.mass.music.tracks.library_items(
+                limit=song_count, offset=song_offset, order_by=order_by
+            )
+            songs = [_song_dict(t) for t in tracks if isinstance(t, Track)]
             key = "searchResult3" if search_type == "search3" else "searchResult2"
             return self._respond({key: {"artist": [], "album": [], "song": songs}})
 
@@ -898,20 +922,51 @@ class AmcfyBridgePlugin(PluginProvider):
                 return data
         plain = None
         lrc = None
+        # Fast path: read whatever lyrics are already attached to the track / cached
+        # by MA (no network round-trip). This avoids 30s+ waits on repeat plays.
         try:
-            if track.metadata and track.metadata.lyrics:
-                track.metadata.lyrics = None
-                track.metadata.lrc_lyrics = None
-            await self.mass.metadata._update_track_metadata(track, force_refresh=True)
-            result = await self.mass.metadata.get_track_lyrics(track)
-            plain = result[0] if result else None
-        except Exception:
-            pass
-        try:
-            raw = await self.mass.metadata._get_track_lyrics(track)
-            lrc = raw[1] if raw else None
-        except Exception:
-            pass
+            get_lyrics = getattr(self.mass.metadata, "get_track_lyrics", None)
+            if get_lyrics is not None:
+                result = await get_lyrics(track)
+                if result and (result[0] or result[1]):
+                    plain = result[0]
+                    lrc = result[1]
+        except Exception as e:
+            self.logger.debug("get_track_lyrics (fast) failed for %s: %s", track.uri, e)
+
+        # Slow path: only if we still have no lyrics, force-refresh rich metadata
+        # (triggers lyrics providers like netease_lyrics). Best-effort — for pure
+        # online provider items the final write-to-library step raises, but lyrics
+        # are already merged into track.metadata before that, so we swallow it.
+        if not (plain or lrc):
+            try:
+                if track.metadata and track.metadata.lyrics:
+                    track.metadata.lyrics = None
+                    track.metadata.lrc_lyrics = None
+                update_meta = getattr(self.mass.metadata, "_update_track_metadata", None)
+                if update_meta is not None:
+                    try:
+                        await update_meta(track, force_refresh=True)
+                    except Exception as e:
+                        self.logger.debug(
+                            "lyrics metadata refresh (non-fatal) for %s: %s", track.uri, e
+                        )
+                get_lyrics = getattr(self.mass.metadata, "get_track_lyrics", None)
+                if get_lyrics is not None:
+                    result = await get_lyrics(track)
+                    if result:
+                        plain = result[0]
+                        lrc = result[1]
+            except Exception as e:
+                self.logger.debug("get_track_lyrics failed for %s: %s\n%s", track.uri, e, __import__("traceback").format_exc())
+        if not lrc:
+            try:
+                legacy = getattr(self.mass.metadata, "_get_track_lyrics", None)
+                if legacy is not None:
+                    raw = await legacy(track)
+                    lrc = raw[1] if raw else None
+            except Exception:
+                pass
         data = (plain, lrc)
         if len(self._lyrics_cache) > 200:
             cutoff = now - CACHE_TTL
@@ -1122,9 +1177,11 @@ class AmcfyBridgePlugin(PluginProvider):
         track = await self._resolve_track(params.get("id", ""))
         if track:
             try:
+                submission = params.get("submission", "true").lower() != "false"
                 await self.mass.music.mark_item_played(
-                    track.media_type, track.uri or track.item_id,
-                    source="Subsonic", elapsed_time=int(params.get("time", "0")),
+                    track,
+                    fully_played=submission,
+                    seconds_played=int(params.get("time", "0")),
                 )
             except Exception:
                 pass
