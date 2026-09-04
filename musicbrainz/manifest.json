@@ -3,7 +3,7 @@
   "domain": "musicbrainz",
   "stage": "stable",
   "name": "MusicBrainz",
-  "description": "MusicBrainz 魔改版 原版2.9.0最少改动",
+  "description": "MusicBrainz 魔改版 原版2.10.x最少改动",
   "codeowners": ["@music-assistant"],
   "requirements": [],
   "documentation": "",

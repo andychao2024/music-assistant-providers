@@ -6,7 +6,9 @@
   "description": "云音乐API歌词插件。",
   "codeowners": ["@andychao2024"],
   "credits": ["NCP API"],
+  "has_setup_flow": true,
   "requirements": [],
   "documentation": "",
-  "icon": "folder-information"
+  "icon": "mdi-folder-information",
+  "version": "1.5.0"
 }

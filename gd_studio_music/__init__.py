@@ -108,12 +108,6 @@ RATE_LIMIT_MAX_REQUESTS = 150
 _LOGGER = logging.getLogger(__name__)
 _LOGGER.setLevel(logging.INFO)
 
-_api_request_counter = defaultdict(int)
-_track_cache = {}
-_duration_cache = {}
-_source_swap_cache = {}
-_failed_track_cache = {}
-
 def format_duration(seconds: int) -> str:
     return "00:00" if seconds <= 0 else f"{seconds // 60:02d}:{seconds % 60:02d}"
 
@@ -259,20 +253,22 @@ async def update_track_lyrics(self, track: Track, track_id: str, source: str) ->
         track.metadata.lrc_lyrics = lyrics
         track.metadata.lyrics = lyrics
 
-def check_rate_limit() -> tuple[bool, str]:
+def check_rate_limit(provider: "GDStudioMusicProvider") -> tuple[bool, str]:
+    """Rate-limit guard. Takes the provider instance so it can touch its per-instance counter."""
     now = time.time()
-    
-    for timestamp in list(_api_request_counter.keys()):
+    counter = provider._api_request_counter
+
+    for timestamp in list(counter.keys()):
         if timestamp < now - RATE_LIMIT_DURATION:
-            del _api_request_counter[timestamp]
-    
-    total_requests = sum(_api_request_counter.values())
+            del counter[timestamp]
+
+    total_requests = sum(counter.values())
     if total_requests >= RATE_LIMIT_MAX_REQUESTS:
         tip_msg = f"请求频繁，请1分钟后再试（5分钟内最多{RATE_LIMIT_MAX_REQUESTS}次）"
         _LOGGER.warning(f"限流触发 | {tip_msg}")
         return False, tip_msg
-    
-    _api_request_counter[int(now // 60) * 60] += 1
+
+    counter[int(now // 60) * 60] += 1
     return True, ""
 
 def get_full_track_id(raw_id: str, source: str = None) -> str:
@@ -317,22 +313,29 @@ class GDStudioMusicProvider(MusicProvider):
         self._default_source = str(self.config.get_value(CONF_DEFAULT_SOURCE, "joox")).strip()
         self._audio_quality = str(self.config.get_value(CONF_AUDIO_QUALITY, "exhigh")).strip()
         self._image_size = str(self.config.get_value(CONF_IMAGE_SIZE, "300")).strip()
-        
+
         self._default_source = self._default_source if self._default_source in SOURCE_VALUES else "joox"
         self._image_size = self._image_size if self._image_size in ["300", "500"] else "300"
         self._br_param = QUALITY_MAPPING.get(self._audio_quality, "320")
-        
+
         self.throttler = ThrottlerManager(rate_limit=5, period=1)
         self.get_lyrics = get_lyrics.__get__(self)
         self.update_track_lyrics = update_track_lyrics.__get__(self)
-        
+
+        # 实例级缓存（每个 provider 实例独立持有，避免多实例间互相污染 / 跨进程内存只增不减）
+        self._api_request_counter = defaultdict(int)
+        self._track_cache: dict = {}
+        self._duration_cache: dict = {}
+        self._source_swap_cache: dict = {}
+        self._failed_track_cache: dict = {}
+
         self._session = aiohttp.ClientSession(
             timeout=API_TIMEOUT,
             headers={"User-Agent": USER_AGENT},
             connector=aiohttp.TCPConnector(ssl=False, limit=5),
             trust_env=True
         )
-        
+
         _LOGGER.info(f"GD Studio Music v{__version__} 初始化完成")
 
     async def handle_async_stop(self) -> None:
@@ -341,11 +344,16 @@ class GDStudioMusicProvider(MusicProvider):
                 await asyncio.wait_for(self._session.close(), timeout=5)
             except Exception as e:
                 _LOGGER.warning(f"关闭会话失败: {e}")
-        
-        _api_request_counter.clear()
+
+        # 清空实例级缓存，防止实例重启后残留
+        self._api_request_counter.clear()
+        self._track_cache.clear()
+        self._duration_cache.clear()
+        self._source_swap_cache.clear()
+        self._failed_track_cache.clear()
 
     async def _api_request(self, api_type: str, params: dict) -> tuple[dict | list, str]:
-        allow_request, tip_msg = check_rate_limit()
+        allow_request, tip_msg = check_rate_limit(self)
         if not allow_request:
             return [] if api_type == "search" else {}, tip_msg
         
@@ -387,16 +395,16 @@ class GDStudioMusicProvider(MusicProvider):
         cache_key = f"{track_id}_{target_br}"
         fail_key = f"{track_id}_{initial_source}"
         
-        if fail_key in _failed_track_cache:
-            if _failed_track_cache[fail_key] > time.time():
+        if fail_key in self._failed_track_cache:
+            if self._failed_track_cache[fail_key] > time.time():
                 return None, None, None, "该歌曲暂时无法播放，请1分钟后再试"
-            del _failed_track_cache[fail_key]
+            del self._failed_track_cache[fail_key]
         
-        if cache_key in _source_swap_cache:
-            cached = _source_swap_cache[cache_key]
+        if cache_key in self._source_swap_cache:
+            cached = self._source_swap_cache[cache_key]
             if cached.get("expire", 0) > time.time():
                 return cached["url"], cached["br"], cached["source"], ""
-            del _source_swap_cache[cache_key]
+            del self._source_swap_cache[cache_key]
         
         source_list = [initial_source] if initial_source in SOURCE_VALUES else []
         source_list.extend([s for s in SOURCE_VALUES if s not in source_list])
@@ -424,7 +432,7 @@ class GDStudioMusicProvider(MusicProvider):
                 url = url_data["url"].strip()
                 actual_br = str(url_data.get("br", br))
                 
-                _source_swap_cache[cache_key] = {
+                self._source_swap_cache[cache_key] = {
                     "url": url,
                     "br": actual_br,
                     "source": source,
@@ -453,7 +461,7 @@ class GDStudioMusicProvider(MusicProvider):
                     url = url_data["url"].strip()
                     actual_br = str(url_data.get("br", br))
                     
-                    _source_swap_cache[cache_key] = {
+                    self._source_swap_cache[cache_key] = {
                         "url": url,
                         "br": actual_br,
                         "source": source,
@@ -462,7 +470,7 @@ class GDStudioMusicProvider(MusicProvider):
                     
                     return url, actual_br, source, ""
         
-        _failed_track_cache[fail_key] = time.time() + 60
+        self._failed_track_cache[fail_key] = time.time() + 60
         return None, None, None, "该歌曲暂时无法获取播放链接，请稍后再试"
 
     async def search(self, search_query: str, media_types: list[MediaType], limit: int = 15) -> SearchResults:
@@ -507,7 +515,7 @@ class GDStudioMusicProvider(MusicProvider):
                 album_name = item.get("album", "未知专辑").strip()
                 pic_id = item.get("pic_id", "")
                 
-                _track_cache[item_id] = {
+                self._track_cache[item_id] = {
                     "name": name,
                     "artist": artist_name,
                     "album": album_name,
@@ -564,12 +572,12 @@ class GDStudioMusicProvider(MusicProvider):
     async def get_track(self, prov_track_id: str, fallback_info: dict | None = None) -> Track:
         full_track_id = get_full_track_id(prov_track_id, self._default_source)
         
-        if full_track_id in _track_cache:
-            cached = _track_cache[full_track_id]
+        if full_track_id in self._track_cache:
+            cached = self._track_cache[full_track_id]
             name = cached["name"]
             artist = cached["artist"]
             album = cached["album"]
-            duration = _duration_cache.get(full_track_id, cached["duration"]) or _duration_cache.get(prov_track_id, 0)
+            duration = self._duration_cache.get(full_track_id, cached["duration"]) or self._duration_cache.get(prov_track_id, 0)
             pic_id = cached["pic_id"]
             source = cached["source"]
         else:
@@ -581,7 +589,7 @@ class GDStudioMusicProvider(MusicProvider):
             name = fallback_info.get("name", full_track_id[:8]) if fallback_info else full_track_id[:8]
             artist = fallback_info.get("artist", "未知艺术家") if fallback_info else "未知艺术家"
             album = fallback_info.get("album", "未知专辑") if fallback_info else "未知专辑"
-            duration = _duration_cache.get(full_track_id, _duration_cache.get(prov_track_id, 0))
+            duration = self._duration_cache.get(full_track_id, self._duration_cache.get(prov_track_id, 0))
             pic_id = ""
 
         pic_url = await self._fetch_pic_url(pic_id, source) if pic_id else None
@@ -642,7 +650,7 @@ class GDStudioMusicProvider(MusicProvider):
             _LOGGER.warning(f"无法解析比特率: {br_str}，使用默认320 kbps")
         
         full_item_id = get_full_track_id(item_id, source)
-        track_duration = _duration_cache.get(full_item_id, _duration_cache.get(item_id, 0))
+        track_duration = self._duration_cache.get(full_item_id, self._duration_cache.get(item_id, 0))
         
         if track_duration <= 0:
             content_type = "flac" if br_str in ["740", "999"] else "mp3"
@@ -652,14 +660,14 @@ class GDStudioMusicProvider(MusicProvider):
             track_duration = await fetch_audio_duration(url, actual_br, content_type)
             
             if track_duration <= 0:
-                track_duration = _track_cache.get(full_item_id, {}).get("raw_duration", 240) or 240
+                track_duration = self._track_cache.get(full_item_id, {}).get("raw_duration", 240) or 240
         
-        if full_item_id not in _duration_cache:
-            _duration_cache[full_item_id] = track_duration
-            _duration_cache[item_id] = track_duration
-            if full_item_id in _track_cache:
-                _track_cache[full_item_id]["duration"] = track_duration
-                _track_cache[full_item_id]["duration_formatted"] = format_duration(track_duration)
+        if full_item_id not in self._duration_cache:
+            self._duration_cache[full_item_id] = track_duration
+            self._duration_cache[item_id] = track_duration
+            if full_item_id in self._track_cache:
+                self._track_cache[full_item_id]["duration"] = track_duration
+                self._track_cache[full_item_id]["duration_formatted"] = format_duration(track_duration)
         
         try:
             updated_track = await self.get_track(full_item_id)
@@ -732,7 +740,7 @@ class GDStudioMusicProvider(MusicProvider):
         )
 
         cover_url = None
-        for track_id, cached in _track_cache.items():
+        for track_id, cached in self._track_cache.items():
             if cached.get("album") == album_name and cached.get("source") == source:
                 pic_id = cached.get("pic_id")
                 if pic_id:
@@ -779,7 +787,7 @@ class GDStudioMusicProvider(MusicProvider):
         )
 
         cover_url = None
-        for track_id, cached in _track_cache.items():
+        for track_id, cached in self._track_cache.items():
             if cached.get("artist") == artist_name and cached.get("source") == source:
                 pic_id = cached.get("pic_id")
                 if pic_id:
@@ -819,47 +827,43 @@ class GDStudioMusicProvider(MusicProvider):
     async def browse(self, path: str | None = None) -> list:
         return []
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        return (
+            ConfigEntry(
+                key=CONF_DEFAULT_SOURCE,
+                type=ConfigEntryType.STRING,
+                label="默认音乐源",
+                required=True,
+                default_value="joox",
+                options=[ConfigValueOption(title=name, value=value) for name, value in STABLE_SOURCES],
+            ),
+            ConfigEntry(
+                key=CONF_AUDIO_QUALITY,
+                type=ConfigEntryType.STRING,
+                label="音质",
+                default_value="exhigh",
+                options=(
+                    ConfigValueOption(title="标准 (128k)", value="standard"),
+                    ConfigValueOption(title="较高 (192k)", value="higher"),
+                    ConfigValueOption(title="极高 (320k)", value="exhigh"),
+                    ConfigValueOption(title="无损 (740k)", value="lossless"),
+                    ConfigValueOption(title="Hi-Res (999k)", value="hires"),
+                ),
+            ),
+            ConfigEntry(
+                key=CONF_IMAGE_SIZE,
+                type=ConfigEntryType.STRING,
+                label="封面尺寸",
+                required=True,
+                default_value="300",
+                options=[
+                    ConfigValueOption(title="小图 (300px)", value="300"),
+                    ConfigValueOption(title="大图 (500px)", value="500"),
+                ],
+            ),
+        )
+
+
 async def setup(mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig) -> MusicProvider:
     _LOGGER.info(f"启动 GD Studio Music v{__version__}")
     return GDStudioMusicProvider(mass, manifest, config)
-
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    return (
-        ConfigEntry(
-            key=CONF_DEFAULT_SOURCE,
-            type=ConfigEntryType.STRING,
-            label="默认音乐源",
-            required=True,
-            default_value="joox",
-            options=[ConfigValueOption(title=name, value=value) for name, value in STABLE_SOURCES],
-        ),
-        ConfigEntry(
-            key=CONF_AUDIO_QUALITY,
-            type=ConfigEntryType.STRING,
-            label="音质",
-            default_value="exhigh",
-            options=(
-                ConfigValueOption(title="标准 (128k)", value="standard"),
-                ConfigValueOption(title="较高 (192k)", value="higher"),
-                ConfigValueOption(title="极高 (320k)", value="exhigh"),
-                ConfigValueOption(title="无损 (740k)", value="lossless"),
-                ConfigValueOption(title="Hi-Res (999k)", value="hires"),
-            ),
-        ),
-        ConfigEntry(
-            key=CONF_IMAGE_SIZE,
-            type=ConfigEntryType.STRING,
-            label="封面尺寸",
-            required=True,
-            default_value="300",
-            options=[
-                ConfigValueOption(title="小图 (300px)", value="300"),
-                ConfigValueOption(title="大图 (500px)", value="500"),
-            ],
-        ),
-    )

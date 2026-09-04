@@ -616,7 +616,7 @@ class DoubanMetadataProvider(MetadataProvider):
             return metadata
 
         except Exception:
-            self.logger.error("[豆瓣元数据] 专辑元数据获取失败: %s", album_name)
+            self.logger.exception("[豆瓣元数据] 专辑元数据获取失败: %s", album_name)
             album.artists = original_artists
             return None
 
@@ -652,7 +652,7 @@ class DoubanMetadataProvider(MetadataProvider):
             return metadata
 
         except Exception:
-            self.logger.error("[豆瓣元数据] 曲目元数据获取失败: %s", search_query)
+            self.logger.exception("[豆瓣元数据] 曲目元数据获取失败: %s", search_query)
             return None
 
     def _make_image_path(self, url: str) -> str:
@@ -902,40 +902,3 @@ class DoubanMetadataProvider(MetadataProvider):
 
 async def setup(mass: "MusicAssistant", manifest: "ProviderManifest", config: "ProviderConfig") -> "ProviderInstanceType":
     return DoubanMetadataProvider(mass, manifest, config, SUPPORTED_FEATURES)
-
-
-async def get_config_entries(mass: "MusicAssistant", instance_id: str | None = None, action: str | None = None, values: dict[str, "ConfigValueType"] | None = None) -> tuple[ConfigEntry, ...]:
-    return (
-        ConfigEntry(
-            key=ConfigKeys.ENABLE_ARTIST_METADATA,
-            type=ConfigEntryType.BOOLEAN,
-            label="启用艺术家元数据",
-            default_value=True,
-            required=False,
-            description="获取艺术家封面、简介、流派",
-        ),
-        ConfigEntry(
-            key=ConfigKeys.ENABLE_ALBUM_METADATA,
-            type=ConfigEntryType.BOOLEAN,
-            label="启用专辑元数据",
-            default_value=True,
-            required=False,
-            description="获取专辑封面、流派、年份、简介",
-        ),
-        ConfigEntry(
-            key=ConfigKeys.ENABLE_TRACK_METADATA,
-            type=ConfigEntryType.BOOLEAN,
-            label="启用曲目元数据",
-            default_value=True,
-            required=False,
-            description="获取曲目封面、流派",
-        ),
-        ConfigEntry(
-            key=ConfigKeys.ENABLE_IMAGES,
-            type=ConfigEntryType.BOOLEAN,
-            label="启用封面下载",
-            default_value=True,
-            required=False,
-            description="下载高清封面图片",
-        ),
-    )

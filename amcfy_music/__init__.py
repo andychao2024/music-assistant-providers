@@ -3,7 +3,7 @@ Amcfy Music Subsonic Bridge Plugin for Music Assistant.
 
 Subsonic API bridge for Amcfy Music client - browse and stream all MA music
 sources (local files, Spotify, Tidal, NetEase, etc.) via Subsonic protocol.
-v1.0.5
+v1.0.8
 """
 
 from __future__ import annotations
@@ -97,6 +97,14 @@ PLACEHOLDER_PNG = (
 CORS_HEADERS = {"Access-Control-Allow-Origin": "*"}
 AUDIO_EXTS = frozenset({".mp3", ".flac", ".wav", ".ogg", ".opus", ".aac", ".m4a", ".wma", ".aiff", ".alac", ".dsf", ".dff"})
 
+
+def _safe_int(val, default=0):
+    """Safely convert a value to int."""
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return default
+
 def _guess_image_mime(data: bytes) -> str:
     for magic, mime in COVER_ART_MIME.items():
         if data[: len(magic)] == magic:
@@ -172,7 +180,7 @@ def _format_timestamp(ts: int | float | datetime | None) -> str:
             ts = ts / 1000
     else:
         ts = time.time()
-    if not ts:
+    if ts is None:
         ts = time.time()
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
@@ -229,6 +237,8 @@ def _song_dict(track: Track) -> dict:
             bit_rate = af.bit_rate
         file_size = getattr(pm, "file_size", 0) or 0
     genres = track.metadata and track.metadata.genres
+    if genres and not hasattr(genres, '__iter__'):
+        genres = [genres] if genres else []
     year = (album and album.year) or ""
     if not year and track.metadata and track.metadata.release_date:
         year = track.metadata.release_date.year
@@ -255,13 +265,15 @@ def _song_dict(track: Track) -> dict:
         "albumId": album.uri if album else "",
         "artistId": artist.uri if artist else "",
         "genre": next(iter(genres), "") if genres else "",
-        "bitRate": bit_rate or "",
+        "bitRate": bit_rate or 0,
     }
 
 
 def _album_dict(album: Album, track_count: int = 0, duration: int = 0) -> dict:
     artist = album.artists[0] if album.artists else None
     genres = album.metadata and album.metadata.genres
+    if genres and isinstance(genres, str):
+        genres = [genres]
     return {
         "id": album.uri or album.item_id,
         "name": album.name,
@@ -336,64 +348,6 @@ def _persist_token(mass, instance_id: str, token: str) -> None:
         pass
 
 
-async def get_config_entries(
-    mass: MusicAssistant | None = None,
-    instance_id: str | None = None,
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    token = ""
-    if instance_id and mass is not None:
-        token = _get_raw_config_value(mass, instance_id, CONF_TOKEN)
-    if action == "regenerate_token":
-        new_token = secrets.token_hex(16)
-        if instance_id and mass is not None:
-            _persist_token(mass, instance_id, new_token)
-        token = new_token
-    if not token:
-        token = secrets.token_hex(16)
-
-    search_scope = ""
-    if values and values.get(CONF_SEARCH_SCOPE):
-        search_scope = str(values[CONF_SEARCH_SCOPE])
-    elif instance_id and mass is not None:
-        search_scope = _get_raw_config_value(mass, instance_id, CONF_SEARCH_SCOPE)
-    if not search_scope:
-        search_scope = "library"
-
-    return (
-        ConfigEntry(
-            key=CONF_TOKEN,
-            type=ConfigEntryType.STRING,
-            label="API Token",
-            description="Token for Subsonic auth (p=xxx or t=md5(token+salt)&s=salt).",
-            required=True,
-            value=token,
-        ),
-        ConfigEntry(
-            key="regenerate_token",
-            type=ConfigEntryType.ACTION,
-            action="regenerate_token",
-            action_label="Regenerate Token",
-            label="Regenerate Token",
-            description="Generate a new random API token",
-        ),
-        ConfigEntry(
-            key=CONF_SEARCH_SCOPE,
-            type=ConfigEntryType.STRING,
-            label="Search Scope",
-            description="搜索范围: 本地曲库(Library only) / 全部曲库(All sources including online)",
-            default_value="library",
-            required=True,
-            value=search_scope,
-            options=[
-                ConfigValueOption(value="library", title="本地曲库 (Library only)"),
-                ConfigValueOption(value="all", title="全部曲库 (All sources including online)"),
-            ],
-        ),
-    )
-
-
 CACHE_TTL = 300
 
 class AmcfyBridgePlugin(PluginProvider):
@@ -410,17 +364,73 @@ class AmcfyBridgePlugin(PluginProvider):
         self._lyrics_cache = {}
         self._response_fmt = "xml"
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        # values (UI edits) win over setup_data (only written by the setup flow).
+        # Otherwise UI edits would be masked by the original setup-time token.
+        token = self.config.get_value(CONF_TOKEN) or self.get_setup_value(CONF_TOKEN, "") or ""
+        if not token:
+            token = secrets.token_hex(16)
+
+        search_scope = self.get_setup_value(CONF_SEARCH_SCOPE, "library") or self.config.get_value(CONF_SEARCH_SCOPE) or "library"
+        if not search_scope:
+            search_scope = "library"
+
+        return (
+            ConfigEntry(
+                key=CONF_TOKEN,
+                type=ConfigEntryType.STRING,
+                label="API Token",
+                description="Token for Subsonic auth (p=xxx or t=md5(token+salt)&s=salt).",
+                required=True,
+                default_value="",
+                value=token,
+            ),
+            ConfigEntry(
+                key="regenerate_token",
+                type=ConfigEntryType.ACTION,
+                action="regenerate_token",
+                action_label="Regenerate Token",
+                label="Regenerate Token",
+                description="Generate a new random API token",
+            ),
+            ConfigEntry(
+                key=CONF_SEARCH_SCOPE,
+                type=ConfigEntryType.STRING,
+                label="Search Scope",
+                description="搜索范围: 本地曲库(Library only) / 全部曲库(All sources including online)",
+                default_value="library",
+                required=True,
+                value=search_scope,
+                options=[
+                    ConfigValueOption(value="library", title="本地曲库 (Library only)"),
+                    ConfigValueOption(value="all", title="全部曲库 (All sources including online)"),
+                ],
+            ),
+        )
+
+    async def handle_config_action(self, action: str) -> tuple[ConfigEntry, ...] | None:
+        if action == "regenerate_token":
+            new_token = secrets.token_hex(16)
+            _persist_token(self.mass, self.instance_id, new_token)
+            self._api_token = new_token
+            return await self.get_config_entries()
+        return None
+
     async def loaded_in_mass(self) -> None:
-        self._api_token = self.config.get_value(CONF_TOKEN) or ""
-        if not self._api_token:
-            self._api_token = secrets.token_hex(16)
-            _persist_token(self.mass, self.instance_id, self._api_token)
-            self.logger.info("Generated new API token: %s", self._api_token)
-        for path in ("/rest/*", "/rest/rest/*", "//rest/*"):
-            cb = self.mass.webserver.register_dynamic_route(
-                path, self._handle_request, "*"
-            )
-            self._unload_callbacks.append(cb)
+        # values (UI edits) win over setup_data (only written by the setup flow).
+        # Otherwise UI edits would be masked by the original setup-time token.
+        token = self.config.get_value(CONF_TOKEN) or self.get_setup_value(CONF_TOKEN, "") or ""
+        if not token:
+            token = secrets.token_hex(16)
+            _persist_token(self.mass, self.instance_id, token)
+            self.logger.info("Generated new API token: %s", token)
+        else:
+            _persist_token(self.mass, self.instance_id, token)
+        self._api_token = token
+        cb = self.mass.webserver.register_dynamic_route(
+            "/rest/*", self._handle_request, "*"
+        )
+        self._unload_callbacks.append(cb)
         self.logger.info("Amcfy Music Subsonic Bridge ready at /rest/*")
 
     async def unload(self, is_removed: bool = False) -> None:
@@ -471,7 +481,7 @@ class AmcfyBridgePlugin(PluginProvider):
                 "Access-Control-Allow-Headers": "*",
             })
         endpoint = request.path.removesuffix(".view").rsplit("/", 1)[-1]
-        params = {k.lower(): v if isinstance(v, str) else str(v[-1]) for k, v in request.query.items()}
+        params = {k.lower(): (v[0] if isinstance(v, list) else v) if isinstance(v, (str, list)) else str(v) for k, v in request.query.items()}
         if request.method.upper() == "POST" and request.body_exists:
             try:
                 form = await request.post()
@@ -726,8 +736,8 @@ class AmcfyBridgePlugin(PluginProvider):
 
     async def handle_get_album_list(self, request: web.Request, params: dict[str, str]) -> web.Response:
         atype = params.get("type", "newest")
-        size = int(params.get("size", "50"))
-        offset = int(params.get("offset", "0"))
+        size = _safe_int(params.get("size", "50"))
+        offset = _safe_int(params.get("offset", "0"))
         is_id3 = request.path.removesuffix(".view").endswith("2")
 
         albums: list[Album] = []
@@ -754,8 +764,8 @@ class AmcfyBridgePlugin(PluginProvider):
             random.shuffle(all_albums)
             albums = all_albums
         elif atype == "byYear":
-            from_year = int(params.get("fromYear", "1900"))
-            to_year = int(params.get("toYear", "2100"))
+            from_year = _safe_int(params.get("fromYear", "1900"))
+            to_year = _safe_int(params.get("toYear", "2100"))
             all_albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX)
             albums = [a for a in all_albums if a.year and from_year <= a.year <= to_year]
         elif atype == "byGenre":
@@ -815,12 +825,12 @@ class AmcfyBridgePlugin(PluginProvider):
 
     async def _handle_search(self, request: web.Request, params: dict[str, str], search_type: str) -> web.Response:
         query = params.get("query", "")
-        artist_count = int(params.get("artistcount", "20"))
-        artist_offset = int(params.get("artistoffset", "0"))
-        album_count = int(params.get("albumcount", "20"))
-        album_offset = int(params.get("albumoffset", "0"))
-        song_count = int(params.get("songcount", "20"))
-        song_offset = int(params.get("songoffset", "0"))
+        artist_count = _safe_int(params.get("artistcount", "20"))
+        artist_offset = _safe_int(params.get("artistoffset", "0"))
+        album_count = _safe_int(params.get("albumcount", "20"))
+        album_offset = _safe_int(params.get("albumoffset", "0"))
+        song_count = _safe_int(params.get("songcount", "20"))
+        song_offset = _safe_int(params.get("songoffset", "0"))
 
         if not query:
             order_by = self._resolve_search_order(params.get("order", ""), params.get("by", "ASC"))
@@ -836,7 +846,7 @@ class AmcfyBridgePlugin(PluginProvider):
         results = await self.mass.music.search(
             query,
             media_types=[MediaType.ARTIST, MediaType.ALBUM, MediaType.TRACK],
-            limit=artist_count + album_count + song_count,
+            limit=max(artist_count, album_count, song_count) * 3,
             library_only=library_only,
         )
 
@@ -860,7 +870,7 @@ class AmcfyBridgePlugin(PluginProvider):
         return self._respond({"searchResult2": {"artist": artists, "album": albums, "song": songs}})
 
     async def handle_random_songs(self, request: web.Request, params: dict[str, str]) -> web.Response:
-        size = int(params.get("size", "10"))
+        size = _safe_int(params.get("size", "10"))
         tracks = await self.mass.music.tracks.library_items(limit=LIBRARY_MAX)
         selected = random.sample(list(tracks), min(size, len(tracks)))
         return self._respond({"randomSongs": {"song": [_song_dict(t) for t in selected]}})
@@ -877,8 +887,8 @@ class AmcfyBridgePlugin(PluginProvider):
 
     async def handle_songs_by_genre(self, request: web.Request, params: dict[str, str]) -> web.Response:
         genre = params.get("genre", "")
-        count = int(params.get("count", "10"))
-        offset = int(params.get("offset", "0"))
+        count = _safe_int(params.get("count", "10"))
+        offset = _safe_int(params.get("offset", "0"))
         tracks = await self.mass.music.tracks.library_items(limit=LIBRARY_MAX)
         if genre:
             filtered = [t for t in tracks if t.metadata and t.metadata.genres and genre in t.metadata.genres]
@@ -1181,14 +1191,14 @@ class AmcfyBridgePlugin(PluginProvider):
                 await self.mass.music.mark_item_played(
                     track,
                     fully_played=submission,
-                    seconds_played=int(params.get("time", "0")),
+                    seconds_played=_safe_int(params.get("time", "0")),
                 )
             except Exception:
                 pass
         return self._respond()
 
     async def handle_get_artist_info2(self, request: web.Request, params: dict[str, str]) -> web.Response:
-        count = int(params.get("count", 25))
+        count = _safe_int(params.get("count", 25))
         info = {"artistInfo2": {
             "biography": "", "musicBrainzId": "", "lastFmUrl": "",
             "smallImageUrl": "", "mediumImageUrl": "", "largeImageUrl": "",
@@ -1306,12 +1316,20 @@ class AmcfyBridgePlugin(PluginProvider):
             await proc.wait()
             err_text = (await proc.stderr.read()).decode("utf-8", errors="replace")
             if proc.returncode != 0:
-                self.logger.debug("FFmpeg exit %d for %s: %s", proc.returncode, url[:60], err_text[:200])
+                _host = url.split("//", 1)[-1].split("/", 1)[0] if isinstance(url, str) and "://" in url else url[:60]
+                self.logger.info(
+                    "stream: ffmpeg failed | host=%s | returncode=%d | err_first_line=%s",
+                    _host, proc.returncode, (err_text.strip().splitlines() or [""])[0][:200],
+                )
             return resp
         except (ConnectionResetError, ConnectionAbortedError, ConnectionError):
             return resp
         except Exception as e:
-            self.logger.debug("FFmpeg stream fail: %s: %s", url[:60], e)
+            _host = url.split("//", 1)[-1].split("/", 1)[0] if isinstance(url, str) and "://" in url else url[:60]
+            self.logger.info(
+                "stream: ffmpeg exception | host=%s | err=%s: %s",
+                _host, type(e).__name__, e,
+            )
             return None
         finally:
             if proc and proc.returncode is None:
@@ -1327,7 +1345,6 @@ class AmcfyBridgePlugin(PluginProvider):
         if "qq.com" in url or "qpic.cn" in url:
             h["Referer"] = "https://y.qq.com/"
             h["Origin"] = "https://y.qq.com"
-            h["Cookie"] = "uin=o511092004; qm_keyst=fcde5b87-a2c2-4e02-8347-573c10c6ea95"
         if "126.net" in url or "163.com" in url or "music.163.com" in url:
             h["Referer"] = "https://music.163.com/"
             h["Origin"] = "https://music.163.com"
@@ -1354,6 +1371,10 @@ class AmcfyBridgePlugin(PluginProvider):
         proxy_headers = await self._get_browser_headers(url)
         if seek_pos:
             proxy_headers["Range"] = f"bytes={seek_pos}-"
+        _host = url.split("//", 1)[-1].split("/", 1)[0] if isinstance(url, str) and "://" in url else url[:60]
+        import time as _time
+        _t_start = _time.monotonic()
+        _first_byte_logged = False
         for retry in range(retries):
             try:
                 async with self.mass.http_session.get(
@@ -1361,15 +1382,45 @@ class AmcfyBridgePlugin(PluginProvider):
                     timeout=aiohttp.ClientTimeout(total=60, connect=10)
                 ) as src:
                     if src.status not in (200, 206):
-                        self.logger.debug("proxy upstream %d for %s", src.status, url[:60])
+                        self.logger.info(
+                            "stream: proxy upstream non-2xx | host=%s | status=%d | attempt=%d",
+                            _host, src.status, retry + 1,
+                        )
                         continue
+                    # Propagate Content-Length / Content-Range / Accept-Ranges from
+                    # upstream so the client sees correct response metadata. For
+                    # HTTP sources (netease/qq/gd), our local mapping.file_size is
+                    # unknown, so without this propagation the client receives a
+                    # 206 response with no Content-Range (illegal per RFC 7233)
+                    # and the Amcfy Dart client aborts + re-requests in a tight
+                    # loop — observed on track/32 Man on the Moon 2026-09-04.
+                    up_cl = src.headers.get("Content-Length")
+                    up_cr = src.headers.get("Content-Range")
+                    if up_cl and not resp.headers.get("Content-Length"):
+                        resp.headers["Content-Length"] = up_cl
+                    if up_cr and not resp.headers.get("Content-Range"):
+                        resp.headers["Content-Range"] = up_cr
+                    if src.headers.get("Accept-Ranges") and not resp.headers.get("Accept-Ranges"):
+                        resp.headers["Accept-Ranges"] = src.headers["Accept-Ranges"]
+                    total = 0
                     while True:
                         if getattr(request, 'transport', None) and request.transport.is_closing():
                             return resp
                         chunk = await src.content.read(65536)
                         if not chunk:
                             break
+                        if not _first_byte_logged:
+                            _first_byte_logged = True
+                            self.logger.info(
+                                "stream: proxy first byte | host=%s | latency=%.3fs | status=%d | cl=%s | cr=%s",
+                                _host, _time.monotonic() - _t_start, src.status, up_cl or "?", up_cr or "?",
+                            )
                         await resp.write(chunk)
+                        total += len(chunk)
+                    self.logger.info(
+                        "stream: proxy done | host=%s | bytes=%d | duration=%.2fs",
+                        _host, total, _time.monotonic() - _t_start,
+                    )
                 return resp
             except (ConnectionResetError, ConnectionAbortedError, aiohttp.ClientPayloadError, ConnectionError):
                 if retry < 2:
@@ -1379,6 +1430,12 @@ class AmcfyBridgePlugin(PluginProvider):
                 if retry < 2:
                     await asyncio.sleep(1.5 * (retry + 1))
                     continue
+        # All retries exhausted — fall back to ffmpeg (slower first byte but
+        # bypasses some CDN/proxy quirks).
+        self.logger.info(
+            "stream: proxy exhausted retries, falling back to ffmpeg | host=%s | elapsed=%.2fs",
+            _host, _time.monotonic() - _t_start,
+        )
         return await self._stream_via_ffmpeg(resp, url, suffix, request)
 
     async def _stream_head(self, track, content_type) -> web.Response:
@@ -1396,51 +1453,104 @@ class AmcfyBridgePlugin(PluginProvider):
             headers["Content-Length"] = str(file_size)
         return web.Response(status=200, headers=headers)
 
-    async def handle_stream(self, request: web.Request, params: dict[str, str]) -> web.StreamResponse | web.Response:
-        track = await self._resolve_track(params.get("id", ""))
-        if not track:
-            return self._error(70, "Track not found")
-
-        suffix, content_type = _guess_content_type(track)
-
-        is_head = request.method.upper() == "HEAD"
-        if is_head:
-            return await self._stream_head(track, content_type)
-
-        pm, music_provider = None, None
-        mp = track.provider_mappings
-        if mp:
-            pm = next(iter(mp))
-        if not pm:
-            return self._error(0, "No provider mapping")
-
-        for mapping in mp:
-            try:
-                music_provider = self.mass.get_provider(mapping.provider_instance)
-            except Exception:
-                pass
-            if not music_provider and mapping.provider_domain:
-                for prov in self.mass.providers:
-                    if prov.domain == mapping.provider_domain:
-                        music_provider = prov
-                        break
-            if music_provider and hasattr(music_provider, "get_stream_details"):
-                pm = mapping
-                break
-            else:
-                self.logger.debug("No provider for mapping: inst=%s dom=%s",
-                    mapping.provider_instance, mapping.provider_domain)
-        if not music_provider or not hasattr(music_provider, "get_stream_details"):
-            self.logger.debug(
-                "No streaming provider found for %s (%d mappings)",
-                params.get("id", ""), len(mp))
-            return self._error(0, "Provider does not support streaming")
-
+    async def _try_stream_provider(
+        self, track: Track, mapping, request: web.Request, params: dict[str, str],
+        suffix: str, content_type: str,
+    ) -> web.StreamResponse | None:
+        """Try to stream from a single provider mapping. Returns response on success, None on failure."""
+        music_provider = None
         try:
-            stream_details = await music_provider.get_stream_details(pm.item_id, MediaType.TRACK)
+            music_provider = self.mass.get_provider(mapping.provider_instance)
+        except Exception:
+            pass
+        if not music_provider and mapping.provider_domain:
+            for prov in self.mass.providers:
+                if prov.domain == mapping.provider_domain:
+                    music_provider = prov
+                    break
+        if not music_provider or not hasattr(music_provider, "get_stream_details"):
+            self.logger.info(
+                "stream: skip mapping, no usable provider | track=%s | provider_instance=%s | provider_domain=%s",
+                params.get("id", ""), mapping.provider_instance, mapping.provider_domain,
+            )
+            return None
+
+        self.logger.info(
+            "stream: try mapping | track=%s | provider=%s/%s | item_id=%s | audio_format=%s",
+            params.get("id", ""),
+            mapping.provider_domain, mapping.provider_instance,
+            mapping.item_id,
+            getattr(mapping, "audio_format", None),
+        )
+
+        stream_details = None
+        try:
+            stream_details = await music_provider.get_stream_details(mapping.item_id, MediaType.TRACK)
         except Exception as e:
-            self.logger.debug("get_stream_details failed: %s", e)
-            return self._error(0, "Stream unavailable")
+            self.logger.info(
+                "stream: get_stream_details raised | track=%s | provider=%s | item_id=%s | err=%s: %s",
+                params.get("id", ""), mapping.provider_domain, mapping.item_id,
+                type(e).__name__, e,
+            )
+            return None
+        if not stream_details:
+            self.logger.info(
+                "stream: get_stream_details returned None | track=%s | provider=%s | item_id=%s",
+                params.get("id", ""), mapping.provider_domain, mapping.item_id,
+            )
+            return None
+
+        # Surface what the provider gave us so playback issues are debuggable from the
+        # log alone — provider domain, audio format, stream URL host, duration, flags.
+        sd_path = getattr(stream_details, "path", None) or ""
+        url_host = ""
+        if isinstance(sd_path, str) and sd_path.startswith(("http://", "https://")):
+            try:
+                url_host = sd_path.split("//", 1)[1].split("/", 1)[0]
+            except Exception:
+                url_host = sd_path[:60]
+        sd_data = getattr(stream_details, "data", None)
+        sd_data_preview = bool(isinstance(sd_data, dict) and sd_data.get("preview"))
+        self.logger.info(
+            "stream: got stream_details | track=%s | provider=%s | stream_type=%s | "
+            "format=%s/%s | duration=%ss | size=%s | url_host=%s | data_preview=%s | "
+            "expiration=%s | can_seek=%s",
+            params.get("id", ""),
+            mapping.provider_domain,
+            getattr(stream_details, "stream_type", None),
+            getattr(stream_details, "audio_format", None),
+            content_type,
+            getattr(stream_details, "duration", None),
+            getattr(stream_details, "size", None),
+            url_host or "(none)",
+            sd_data_preview,
+            getattr(stream_details, "expiration", None),
+            getattr(stream_details, "can_seek", None),
+        )
+
+        # Skip preview-only streams so handle_stream falls through to the next
+        # provider mapping. QQ Music (and similar) explicitly mark 30-second
+        # preview snippets via data["preview"]=True and a non-None duration;
+        # without this check the Amcfy client would play ~30s, hit EOF, and
+        # skip the song on its own.
+        sd_data = getattr(stream_details, "data", None)
+        is_preview = isinstance(sd_data, dict) and bool(sd_data.get("preview"))
+        stream_duration = getattr(stream_details, "duration", None)
+        track_duration = getattr(track, "duration", None) or 0
+        if (
+            not is_preview
+            and stream_duration
+            and track_duration > 0
+            and stream_duration + 10 < track_duration
+        ):
+            is_preview = True
+        if is_preview:
+            self.logger.info(
+                "Provider %s only offers a preview snippet for %s "
+                "(track=%ss, stream=%ss); trying next mapping",
+                mapping.provider_domain, mapping.item_id, track_duration, stream_duration,
+            )
+            return None
 
         seek_pos = 0
         range_hdr = request.headers.get("Range", "")
@@ -1458,11 +1568,23 @@ class AmcfyBridgePlugin(PluginProvider):
             "Connection": "keep-alive",
             "Access-Control-Allow-Origin": "*",
         }
-        if pm:
-            file_size = getattr(pm, "file_size", 0) or 0
+        file_size = getattr(mapping, "file_size", 0) or 0
+        if file_size > 0:
+            common_headers["Content-Length"] = str(file_size)
+        # Honor the client's Range request with 206 Partial Content so Subsonic
+        # clients (e.g. Amcfy Music Dart) recognize the stream as seekable.
+        # Without 206, some clients abort the connection on 200 + Content-Range.
+        if range_hdr and seek_pos is not None:
+            _status = 206
             if file_size > 0:
-                common_headers["Content-Length"] = str(file_size)
-        resp = web.StreamResponse(status=200, headers=dict(common_headers))
+                common_headers["Content-Range"] = "bytes {}-{}/{}".format(seek_pos, file_size - 1, file_size)
+        else:
+            _status = 200
+        self.logger.info(
+            "stream: resp prepare | track=%s | status=%d | range=%r | seek=%d | size=%d | ct=%s",
+            params.get("id", ""), _status, range_hdr, seek_pos, file_size, content_type,
+        )
+        resp = web.StreamResponse(status=_status, headers=dict(common_headers))
         await resp.prepare(request)
 
         # Strategy 1: CUSTOM stream type – use get_audio_stream
@@ -1477,28 +1599,35 @@ class AmcfyBridgePlugin(PluginProvider):
                         await resp.write(chunk)
                     return resp
                 except NotImplementedError:
-                    self.logger.debug("get_audio_stream not implemented for %s", pm.provider_domain)
+                    self.logger.debug("get_audio_stream not implemented for %s", mapping.provider_domain)
                 except (ConnectionResetError, ConnectionAbortedError):
                     return resp
                 except Exception as e:
                     self.logger.debug("get_audio_stream failed: %s", e)
 
-        # Strategy 2: try ffmpeg first for HTTP URLs (handles CDN redirects/reconnects better)
-        source = await self._resolve_source(stream_details, pm)
+        # Strategy 2: HTTP URL — try aiohttp proxy FIRST for fast first-byte,
+        # fall back to ffmpeg if proxy can't pull (CDN quirks, ssl issues, etc.)
+        source = await self._resolve_source(stream_details, mapping)
+        _source_host = ""
+        if isinstance(source, str) and "://" in source:
+            _source_host = source.split("//", 1)[-1].split("/", 1)[0]
         if source and source.startswith(("http://", "https://")):
-            result = await self._stream_via_ffmpeg(resp, source, suffix, request)
+            self.logger.info(
+                "stream: strategy=proxy (preferred for fast TTFB) | host=%s | track=%s",
+                _source_host, params.get("id", ""),
+            )
+            result = await self._proxy_stream(resp, source, request, seek_pos, suffix)
             if result:
                 return result
-        # Strategy 3: HTTP proxy (fallback if ffmpeg unavailable)
-        if source:
-            if source.startswith(("http://", "https://")):
-                result = await self._proxy_stream(resp, source, request, seek_pos, suffix)
-                if result:
-                    return result
-            else:
-                result = await self._stream_file(resp, source, seek_pos, request)
-                if result:
-                    return result
+            # proxy_stream fell back to ffmpeg internally; only reach here if
+            # both proxy AND ffmpeg returned None.
+            self.logger.info(
+                "stream: proxy+ffmpeg both failed for %s", _source_host,
+            )
+        elif source:
+            result = await self._stream_file(resp, source, seek_pos, request)
+            if result:
+                return result
 
         # Strategy 4: data field contents
         data = getattr(stream_details, "data", None)
@@ -1523,7 +1652,7 @@ class AmcfyBridgePlugin(PluginProvider):
                                 if await self._stream_data(resp, val.encode()):
                                     return resp
 
-        # Strategy 4: file path from stream_details
+        # Strategy 5: file path from stream_details
         for attr in ("path", "item_id", "uri"):
             fp = getattr(stream_details, attr, None)
             if fp and isinstance(fp, str) and os.path.isabs(fp):
@@ -1533,22 +1662,53 @@ class AmcfyBridgePlugin(PluginProvider):
                     if result:
                         return result
 
-        # Strategy 5: pm.item_id as file path
-        if pm:
-            pid = getattr(pm, "item_id", None)
-            if pid and isinstance(pid, str) and pid.startswith("/"):
-                exists = await asyncio.get_running_loop().run_in_executor(None, os.path.exists, pid)
-                if exists:
-                    result = await self._stream_file(resp, pid, seek_pos, request)
-                    if result:
-                        return result
+        # Strategy 6: pm.item_id as file path
+        pid = getattr(mapping, "item_id", None)
+        if pid and isinstance(pid, str) and pid.startswith("/"):
+            exists = await asyncio.get_running_loop().run_in_executor(None, os.path.exists, pid)
+            if exists:
+                result = await self._stream_file(resp, pid, seek_pos, request)
+                if result:
+                    return result
 
-        # Strategy 6: Fallback to ffmpeg with original path
+        # Strategy 7: Fallback to ffmpeg with original path
         orig_path = getattr(stream_details, "path", None)
         if orig_path:
             result = await self._stream_via_ffmpeg(resp, orig_path, suffix, request)
             if result:
                 return result
 
-        self.logger.debug("All streaming strategies failed for track %s", params.get("id", ""))
-        return resp
+        return None
+
+    async def handle_stream(self, request: web.Request, params: dict[str, str]) -> web.StreamResponse | web.Response:
+        track = await self._resolve_track(params.get("id", ""))
+        if not track:
+            return self._error(70, "Track not found")
+
+        suffix, content_type = _guess_content_type(track)
+
+        is_head = request.method.upper() == "HEAD"
+        if is_head:
+            return await self._stream_head(track, content_type)
+
+        mp = track.provider_mappings
+        if not mp:
+            return self._error(0, "No provider mapping")
+
+        track_name = getattr(track, "name", "") or ""
+        track_duration = getattr(track, "duration", None)
+        self.logger.info(
+            "stream: handle_stream | track=%s | name=%r | duration=%ss | mappings=%d | suffix=%s | content_type=%s",
+            params.get("id", ""), track_name, track_duration, len(mp), suffix, content_type,
+        )
+
+        for mapping in mp:
+            result = await self._try_stream_provider(track, mapping, request, params, suffix, content_type)
+            if result is not None:
+                return result
+
+        self.logger.info(
+            "stream: all mappings failed | track=%s | name=%r | mappings_tried=%d",
+            params.get("id", ""), track_name, len(mp),
+        )
+        return self._error(0, "Stream unavailable")

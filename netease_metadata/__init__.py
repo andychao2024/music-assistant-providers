@@ -173,17 +173,58 @@ class CloudMusicMetadataProvider(MetadataProvider):
     enable_track_metadata: bool
     enable_images: bool
 
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        return (
+            ConfigEntry(
+                key=ConfigKeys.ENABLE_ARTIST_METADATA,
+                type=ConfigEntryType.BOOLEAN,
+                label="启用艺术家元数据获取",
+                default_value=True,
+                required=False,
+            ),
+            ConfigEntry(
+                key=ConfigKeys.ENABLE_ALBUM_METADATA,
+                type=ConfigEntryType.BOOLEAN,
+                label="启用专辑元数据获取",
+                default_value=True,
+                required=False,
+                description="v1.9.8 发布版：优先从歌曲提取专辑ID + 发行年份写入标签",
+            ),
+            ConfigEntry(
+                key=ConfigKeys.ENABLE_TRACK_METADATA,
+                type=ConfigEntryType.BOOLEAN,
+                label="启用歌曲元数据获取",
+                default_value=True,
+                required=False,
+            ),
+            ConfigEntry(
+                key=ConfigKeys.ENABLE_IMAGES,
+                type=ConfigEntryType.BOOLEAN,
+                label="启用图片获取",
+                default_value=True,
+                required=False,
+            ),
+            ConfigEntry(
+                key=ConfigKeys.API_URL,
+                type=ConfigEntryType.STRING,
+                label="自建云音乐API地址",
+                description="你的自建云音乐API服务地址（如http://localhost:3003）",
+                required=True,
+                default_value="http://localhost:3003",
+            ),
+        )
+
     async def handle_async_init(self) -> None:
         self.cache = self.mass.cache
-        
+
         self.api_url = self.config.get_value(ConfigKeys.API_URL, "").rstrip("/")
         self.enable_artist_metadata = self.config.get_value(ConfigKeys.ENABLE_ARTIST_METADATA, True)
         self.enable_album_metadata = self.config.get_value(ConfigKeys.ENABLE_ALBUM_METADATA, True)
         self.enable_track_metadata = self.config.get_value(ConfigKeys.ENABLE_TRACK_METADATA, True)
         self.enable_images = self.config.get_value(ConfigKeys.ENABLE_IMAGES, True)
-        
+
         self.throttler = ThrottlerManager(rate_limit=API_RATE_LIMIT, period=API_RATE_PERIOD)
-        
+
         if not self.api_url:
             self.logger.error("[云音乐元数据] API地址未配置，插件将无法正常工作")
         else:
@@ -229,7 +270,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
             return metadata
             
         except Exception as e:
-            self.logger.error("[云音乐元数据] 艺术家元数据获取失败: %s", cleaned_artist_name)
+            self.logger.exception("[云音乐元数据] 艺术家元数据获取失败: %s", cleaned_artist_name)
             return None
 
     async def _extract_album_id_from_songs(self, search_keywords: list[str], album_name: str, artist_name: str) -> str | None:
@@ -437,7 +478,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
             return metadata
             
         except Exception as e:
-            self.logger.error("[云音乐元数据] 歌曲元数据获取失败: %s", search_keyword)
+            self.logger.exception("[云音乐元数据] 歌曲元数据获取失败: %s", search_keyword)
             return None
 
     def _has_valid_artist_images(self, artist: Artist) -> bool:
@@ -448,7 +489,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
         valid_images = [img for img in artist.images if img.path and img.type == ImageType.THUMB]
         return len(valid_images) > 0
 
-    @use_cache(CACHE_TTL, persistent=True)
+    @use_cache(CACHE_TTL, persistent=True, cache_none=False)
     @throttle_with_retries
     async def _get_data(self, endpoint: str, **kwargs: Any) -> dict[str, Any] | None:
         if not self.api_url:
@@ -531,49 +572,3 @@ async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
     return CloudMusicMetadataProvider(mass, manifest, config, SUPPORTED_FEATURES)
-
-async def get_config_entries(
-    mass: MusicAssistant,
-    instance_id: str | None = None,
-    action: str | None = None,
-    values: dict[str, ConfigValueType] | None = None,
-) -> tuple[ConfigEntry, ...]:
-    return (
-        ConfigEntry(
-            key=ConfigKeys.ENABLE_ARTIST_METADATA,
-            type=ConfigEntryType.BOOLEAN,
-            label="启用艺术家元数据获取",
-            default_value=True,
-            required=False,
-        ),
-        ConfigEntry(
-            key=ConfigKeys.ENABLE_ALBUM_METADATA,
-            type=ConfigEntryType.BOOLEAN,
-            label="启用专辑元数据获取",
-            default_value=True,
-            required=False,
-            description="v1.9.8 发布版：优先从歌曲提取专辑ID + 发行年份写入标签",
-        ),
-        ConfigEntry(
-            key=ConfigKeys.ENABLE_TRACK_METADATA,
-            type=ConfigEntryType.BOOLEAN,
-            label="启用歌曲元数据获取",
-            default_value=True,
-            required=False,
-        ),
-        ConfigEntry(
-            key=ConfigKeys.ENABLE_IMAGES,
-            type=ConfigEntryType.BOOLEAN,
-            label="启用图片获取",
-            default_value=True,
-            required=False,
-        ),
-        ConfigEntry(
-            key=ConfigKeys.API_URL,
-            type=ConfigEntryType.STRING,
-            label="自建云音乐API地址",
-            description="你的自建云音乐API服务地址（如http://localhost:3003）",
-            required=True,
-            default_value="http://localhost:3003",
-        ),
-    )

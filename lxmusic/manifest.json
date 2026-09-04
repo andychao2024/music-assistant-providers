@@ -1,0 +1,14 @@
+{
+  "type": "music",
+  "domain": "lxmusic",
+  "stage": "experimental",
+  "name": "LX Music (洛雪音乐服务端)",
+  "description": "将 LX Music (洛雪音乐) Docker 服务端作为 Music Assistant 的音乐源，支持跨音源搜索、播放与歌词。",
+  "codeowners": ["@billy", "@andychao"],
+  "requirements": ["aiohttp>=3.8.0"],
+  "documentation": "https://github.com/xcq0607/lxserver",
+  "multi_instance": true,
+  "has_setup_flow": true,
+  "version": "1.1.0",
+  "credits": ["andychao 修改 - 适配 MA 2.10.1"]
+}
