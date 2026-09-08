@@ -31,6 +31,7 @@ from music_assistant_models.media_items import (
     BrowseFolder,
     ItemMapping,
     MediaItemImage,
+    MediaItemMetadata,
     Playlist,
     ProviderMapping,
     SearchResults,
@@ -94,6 +95,38 @@ async def setup(
     return LxMusicProvider(mass, manifest, config, SUPPORTED_FEATURES)
 
 
+def _normalize_lx_interval(value: Any) -> str:
+    """把任意 interval 值规范成 lxserver 歌词接口需要的 "MM:SS" 字符串。
+
+    BUG #102 (2026-09-07): lxserver kg/wy SDK 都按字符串 split,纯数字
+    秒数 / float / None 都会让 SDK 在 ``interval.split(':')`` 或
+    ``interval.includes('.')`` 时抛错或丢精度。这里集中处理:
+
+    - 已为 ``"MM:SS"`` / ``"MM:SS.xxx"`` → 原样返回
+    - 数字 / 数字字符串 (秒) → 转成 ``"MM:SS"``
+    - 空 / None / 非法 → 返回 ``""`` (服务端 SDK 自己会用 0 兜底)
+
+    与 lxmusic 自己的字段约定对齐 (lxserver 搜索结果是 ``"04:28"`` 字符串,
+    但 MA track.duration 是秒数, 可能传进来是数字)。
+    """
+    if value is None or value == "":
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    if ":" in s:
+        return s
+    # 纯数字 (秒) → MM:SS
+    try:
+        total = int(float(s))
+    except (TypeError, ValueError):
+        return s  # 给服务端自己处理, 至少不抛
+    if total < 0:
+        return ""
+    m, sec = divmod(total, 60)
+    return f"{m:02d}:{sec:02d}"
+
+
 class LxMusicProvider(MusicProvider):
     """Provide LX Music (洛雪音乐服务端) as a music source."""
 
@@ -142,6 +175,10 @@ class LxMusicProvider(MusicProvider):
         # 缓存已解析的 Track 与原始 item（供 get_track / get_stream_details 复用）
         self._track_cache: dict[str, Track] = {}
         self._raw_cache: dict[str, dict[str, Any]] = {}
+        # BUG #100 (2026-09-07): 歌词 in-memory 缓存, key = prov_track_id
+        # 不持久化到 db (重启后重拉)。值 = lrc 文本 或 None (拉过但没歌词,
+        # 缓存 None 避免重复调 lxserver 浪费 RTT)。
+        self._lyrics_cache: dict[str, str | None] = {}
         # 歌手 / 专辑 / 歌单缓存：记录真实 ID 与名称，供详情 / 曲目接口做兜底回查
         self._artist_cache: dict[str, dict[str, Any]] = {}
         self._album_cache: dict[str, dict[str, Any]] = {}
@@ -856,6 +893,10 @@ class LxMusicProvider(MusicProvider):
         """Get a single track."""
         cached = getattr(self, "_track_cache", {}).get(prov_track_id)
         if cached is not None:
+            # BUG #103 (2026-09-07): _track_cache 可能在搜索/列表等热路径
+            # 由 _parse_track 写入,那时不注入歌词。补一次 _maybe_fetch_lyrics;
+            # 内部 _lyrics_cache 命中即 return,不会重复打 lxserver。
+            await self._maybe_fetch_lyrics(cached)
             return cached
         source, song_id = self._split_id(prov_track_id)
         items = await self._search_source(source, song_id, page_size=5)
@@ -863,6 +904,11 @@ class LxMusicProvider(MusicProvider):
             if self._item_song_id(item) == song_id:
                 track = await self._parse_track(item, source)
                 if track:
+                    # BUG #100 (2026-09-07): 注入歌词到 track.metadata.lrc_lyrics,
+                    # 让 MA lyric controller 第一优先路径命中。
+                    # 仅在 get_track 入口注入 (不在 _parse_track),避免阻塞
+                    # 搜索/歌单列表等热路径。
+                    await self._maybe_fetch_lyrics(track, item)
                     return track
         raise FileNotFoundError(f"Track {prov_track_id} not found")
 
@@ -1278,6 +1324,23 @@ class LxMusicProvider(MusicProvider):
                             "lxmusic: 成功获取播放链接 %s -> %s (quality=%s content_type=%s)",
                             item_id, url[:120], quality, ct,
                         )
+                        # BUG #101 (2026-09-07): StreamDetails 必须设
+                        # allow_seek=True,否则 MA stream controller 默认 False
+                        # 会把用户拖进度条的 seek_position 重置为 0
+                        # (audio.py:699-701 "seeking is not possible on this
+                        # stream!"),体感"拖动进度条无效定位"。
+                        #
+                        # can_seek=True 只表示 MA 可以尝试在 byte 流里 seek;
+                        # allow_seek=True 才是 provider 主动声明 URL 支持
+                        # Range 请求。对照: tidal/streaming.py:156、
+                        # filesystem_local/__init__.py:3437-3548 都显式设
+                        # allow_seek=True。
+                        #
+                        # 风险: 少数 lxserver 自定义源(如某些 meting 镜像)
+                        # 可能不支持 Range。但 amcfy 网桥已经有 BUG #6/#58/#59
+                        # 网易云 Range 偷换 + 嗅探魔数 + 完整拉 + 切片转发保护,
+                        # MA webui 直接播放走原生 Range,网易云 WY 源走 amcfy
+                        # 时已有 host 黑名单兜底,本改动不影响 amcfy 网桥逻辑。
                         return StreamDetails(
                             item_id=item_id,
                             provider=self.instance_id,
@@ -1285,6 +1348,7 @@ class LxMusicProvider(MusicProvider):
                             stream_type=StreamType.HTTP,
                             path=url,
                             can_seek=True,
+                            allow_seek=True,
                         )
                     # 有响应但没提取到 url，记录一下帮助排查
                     LOGGER.debug(
@@ -2963,6 +3027,183 @@ class LxMusicProvider(MusicProvider):
         if hasattr(self, "_raw_cache"):
             self._raw_cache[track.item_id] = raw_for_cache
         return track
+
+    # ------------------------------------------------------------------ #
+    # BUG #100 (2026-09-07): 歌词 — lxserver /api/music/lyric
+    # BUG #102 (2026-09-07): 改用 GET 端点
+    # ------------------------------------------------------------------ #
+    async def _maybe_fetch_lyrics(
+        self, track: Track, raw: dict[str, Any] | None = None
+    ) -> None:
+        """BUG #100/#102: 拉歌词注入 track.metadata.lrc_lyrics。
+
+        - 已有 lyric 跳过 (兜底, 理论上 _parse_track 不会预填)
+        - _lyrics_cache 命中直接用 (含 None 缓存, 避免重复拉空)
+        - 拉取失败 / 没歌词 静默 (DEBUG 日志), 不抛, 不影响 get_track
+        """
+        if track.metadata and track.metadata.lrc_lyrics:
+            return
+        cache_key = track.item_id
+        cached_lrc = getattr(self, "_lyrics_cache", {}).get(cache_key, "__missing__")
+        if cached_lrc != "__missing__":
+            if cached_lrc:
+                self._set_track_lrc(track, cached_lrc)
+            return
+        # 缓存未命中 → 调 lxserver
+        raw_item = raw if raw is not None else self._raw_cache.get(cache_key)
+        try:
+            lrc = await self._fetch_lyrics(cache_key, raw=raw_item)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: 拉歌词异常 track=%s err=%s", cache_key, err)
+            lrc = None
+        if not hasattr(self, "_lyrics_cache"):
+            self._lyrics_cache = {}
+        # 成功 + 失败都缓存 (失败缓存 None, 避免反复打 lxserver)
+        self._lyrics_cache[cache_key] = lrc
+        if lrc:
+            self._set_track_lrc(track, lrc)
+
+    @staticmethod
+    def _set_track_lrc(track: Track, lrc: str) -> None:
+        """把 lrc 文本塞到 track.metadata.lyrics + lrc_lyrics。
+
+        MA lyric controller 第一路径读 metadata.lyrics / metadata.lrc_lyrics,
+        都填保证两端都能渲染。 lyrics 字段由 normalize_lrc_lyrics 处理。
+        """
+        if not track.metadata:
+            track.metadata = MediaItemMetadata()
+        track.metadata.lrc_lyrics = lrc
+        track.metadata.lyrics = lrc
+
+    async def _fetch_lyrics(
+        self,
+        prov_track_id: str,
+        *,
+        raw: dict[str, Any] | None = None,
+    ) -> str | None:
+        """BUG #100/#102: 调 lxserver GET /api/music/lyric 拿歌词。
+
+        返回 lrc 文本 (含 [mm:ss.xx] 时间戳), 没歌词 / 失败 → 返回 None。
+
+        BUG #102 (2026-09-07): 改用 GET 而非 POST。
+        原因: lxserver POST handler (server.js:5029-5031) 写法是
+          `const result = await musicSdk[source].getLyric(songInfo)`
+        但 musicSdk.getLyric 返回 requestObj { isCancelled, promise, ... },
+        不是 Promise, 所以 await 等于立即返回 requestObj 本身。
+        JSON.stringify(requestObj) → {"isCancelled":false,"promise":{}}
+        (Promise 实例被 JSON 序列化为 {}),promise.id 永远为空,
+        SSE 轮询永远拿不到 lyric。
+
+        GET handler (server.js:4014-4019) 写法正确:
+          `const lyricInfo = await requestObj.promise`
+          `res.end(JSON.stringify(lyricInfo))`
+        等 promise resolve 再返回歌词对象。
+
+        各源额外需要的 query 字段 (server.js:3996-4009):
+        - wy: songmid, name, singer, interval (interval 是 "MM:SS" 字符串)
+        - kg: songmid, name, hash, interval ("MM:SS")
+        - mg: songmid, copyrightId, lrcUrl, mrcUrl, trcUrl (没有就先不传)
+        - tx/kw: songmid (interval 选填)
+        """
+        source, song_id = self._split_id(prov_track_id)
+        raw_item = raw or {}
+        singer = self._extract_singer_for_lyric(raw_item) if raw_item else ""
+        name = (raw_item.get("name") or raw_item.get("songName") or "") if raw_item else ""
+        interval_raw = (
+            (raw_item.get("interval") or raw_item.get("duration") or raw_item.get("time") or "")
+            if raw_item
+            else ""
+        )
+        hash_val = (raw_item.get("hash") or "") if raw_item else ""
+
+        # interval 必须是 "MM:SS" 字符串。lxserver 多数 SDK 都按字符串 split。
+        # raw_item.interval 已经就是 "MM:SS" 格式 (lxserver 搜索结果格式);
+        # 如果是纯秒数 (数字 / "234"), 转成 "03:54"。
+        interval_str = _normalize_lx_interval(interval_raw)
+
+        params: dict[str, Any] = {
+            "source": source,
+            "songmid": song_id,
+            "interval": interval_str,
+        }
+        if name:
+            params["name"] = name
+        if singer:
+            params["singer"] = singer
+        if source == "kg" and hash_val:
+            params["hash"] = hash_val
+
+        try:
+            resp = await self._request(
+                "GET", "/api/music/lyric",
+                params=params,
+                timeout=8.0,
+            )
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug(
+                "lxmusic: lyric GET 异常 track=%s params=%s err=%s",
+                prov_track_id, params, err,
+            )
+            return None
+
+        if not isinstance(resp, dict):
+            LOGGER.debug(
+                "lxmusic: lyric 响应非 dict track=%s type=%s",
+                prov_track_id, type(resp).__name__,
+            )
+            return None
+
+        # lxserver GET 直接返回 { lyric, tlyric?, ... } 或纯文本 body
+        return self._extract_lrc_from_payload(resp, source, song_id)
+
+    @staticmethod
+    def _extract_lrc_from_payload(
+        payload: dict[str, Any], source: str, song_id: str
+    ) -> str | None:
+        """从 lxserver lyric 响应 payload 抽 lrc 文本。
+
+        兼容字段差异 (5 源字段可能不同):
+        - data.lyric / data.lrc / data.lyrics (数据嵌套)
+        - lyric / lrc / lyrics (扁平)
+        纯文本含 [mm:ss.xx] 时间戳视为 lrc 格式。
+        """
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+        lrc_raw = (
+            data.get("lyric")
+            or data.get("lrc")
+            or data.get("lyrics")
+            or ""
+        )
+        if not isinstance(lrc_raw, str) or not lrc_raw.strip():
+            LOGGER.debug(
+                "lxmusic: lyric 端点无可用文本 source=%s songmid=%s payload=%s",
+                source, song_id,
+                str(payload)[:400] if isinstance(payload, dict) else payload,
+            )
+            return None
+        LOGGER.debug(
+            "lxmusic: 拉歌词成功 source=%s songmid=%s lrc_len=%d",
+            source, song_id, len(lrc_raw),
+        )
+        return lrc_raw
+
+    @staticmethod
+    def _extract_singer_for_lyric(item: dict[str, Any]) -> str:
+        """从 raw MusicInfo 抽 singer 字符串。
+
+        与 _enrich_playlist_pics._extract_singer 同源逻辑 (list / str / dict 兼容),
+        但抽成独立 static method 避免耦合。
+        """
+        singer_raw = item.get("singer") or ""
+        if isinstance(singer_raw, list):
+            if singer_raw and isinstance(singer_raw[0], dict):
+                return str(singer_raw[0].get("name", "") or "")
+            if singer_raw and isinstance(singer_raw[0], str):
+                return str(singer_raw[0])
+            return ""
+        if isinstance(singer_raw, str):
+            return singer_raw.split("/")[0].split("、")[0].strip()
+        return ""
 
     async def _enrich_playlist_pics(self, items: list[dict[str, Any]]) -> None:
         """补全用户歌单歌曲的封面 + 专辑信息 (就地修改 items)。
