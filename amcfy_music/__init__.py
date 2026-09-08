@@ -1006,11 +1006,16 @@ class AmcfyBridgePlugin(PluginProvider):
         # (triggers lyrics providers like netease_lyrics). Best-effort — for pure
         # online provider items the final write-to-library step raises, but lyrics
         # are already merged into track.metadata before that, so we swallow it.
+        # BUG #105: 删除 "清空 lyrics" 的死代码 — fast path 已经确认 lyrics 为空,
+        # 再清一次没意义,且历史上曾误清已存在的正确歌词(library DB 在两次
+        # amcfy 请求之间被 webui 触发写入了歌词的情况)。
         if not (plain or lrc):
             try:
-                if track.metadata and track.metadata.lyrics:
-                    track.metadata.lyrics = None
-                    track.metadata.lrc_lyrics = None
+                if self.config.get_value(CONF_DEBUG_VERBOSE):
+                    self.logger.debug(
+                        "lyrics slow path | uri=%s | has_metadata=%s | forcing refresh",
+                        track.uri, bool(track.metadata),
+                    )
                 update_meta = getattr(self.mass.metadata, "_update_track_metadata", None)
                 if update_meta is not None:
                     try:
@@ -1041,7 +1046,11 @@ class AmcfyBridgePlugin(PluginProvider):
         if len(self._lyrics_cache) > 200:
             cutoff = now - CACHE_TTL
             self._lyrics_cache = {k: v for k, v in self._lyrics_cache.items() if v[0] > cutoff}
-        self._lyrics_cache[cache_key] = (now, data)
+        # BUG #105: 只缓存成功结果 — 失败/空不缓存
+        # 避免 CACHE_TTL(300s) 内 library DB 后续被填上歌词时,
+        # amcfy 还返回缓存的 (None, None)
+        if data[0] or data[1]:
+            self._lyrics_cache[cache_key] = (now, data)
         return data
 
     async def handle_get_lyrics(self, request: web.Request, params: dict[str, str]) -> web.Response:
