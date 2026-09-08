@@ -493,17 +493,33 @@ class AmcfyBridgePlugin(PluginProvider):
                 pass
         self._unload_callbacks.clear()
 
-    def _verify_token(self, token: str, salt: str) -> bool:
+    def _verify_token(self, token: str, salt: str, api_token: str | None = None) -> bool:
+        # BUG #106: 接受 api_token 参数,默认回退到 self._api_token(向后兼容)
+        if api_token is None:
+            api_token = self._api_token
         return (
-            hashlib.md5((self._api_token + salt).encode()).hexdigest().lower()
+            hashlib.md5((api_token + salt).encode()).hexdigest().lower()
             == token.lower()
         )
+
+    def _current_api_token(self) -> str:
+        # BUG #106: 每次都从 config 读最新 token,避免用户在 webui 改 CONF_TOKEN 后必须重启 MA。
+        # config.get_value 走内存 dict,开销可忽略。loaded_in_mass 仍然在启动时把 token 写入
+        # self._api_token 作为 fallback(防止 config 暂时拿不到值)。
+        try:
+            live = self.config.get_value(CONF_TOKEN)
+        except Exception:
+            live = None
+        if live:
+            return str(live)
+        return self._api_token or ""
 
     def _check_auth(self, params: dict[str, str]) -> bool:
         p, t, s = params.get("p", ""), params.get("t", ""), params.get("s", "")
         api_key = params.get("apikey", "") or params.get("api_key", "")
+        api_token = self._current_api_token()
         if t and s:
-            return self._verify_token(t, s)
+            return self._verify_token(t, s, api_token)
         if not p and api_key:
             p = api_key
         if p:
@@ -512,7 +528,7 @@ class AmcfyBridgePlugin(PluginProvider):
                     p = bytes.fromhex(p[4:]).decode()
                 except (ValueError, UnicodeDecodeError):
                     return False
-            return p == self._api_token
+            return p == api_token
         return False
 
     def _respond(self, data=None, status="ok", fmt=None):
