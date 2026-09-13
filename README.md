@@ -2,34 +2,6 @@
 
 ### 适合国人使用 Music Assistant 最强插件，支持歌手（简介）、专辑、图片、歌词自动补全 
 
-##### 现已支持洛雪服务端接入音乐源
-
-[https://github.com/hjy1728/mass-lxmusic-provider](https://github.com/xcq0607/lxserver)
-
-##### 洛雪服务端 docker compose 版安装（推荐）
-```
-version: '3'
-services:
-  lx-sync-server:
-    image: xcq0607/lxserver:latest
-    container_name: lx-sync-server
-    restart: unless-stopped
-    ports:
-      - "9527:9527"
-    volumes:
-      - ./data:/server/data
-      - ./logs:/server/logs
-      - ./cache:/server/cache
-      - ./music:/server/music
-    environment:
-      - NODE_ENV=production
-      # - FRONTEND_PASSWORD=123456
-      # - ENABLE_WEBPLAYER_AUTH=true
-      # - WEBPLAYER_PASSWORD=yourpassword
-      # - ADMIN_PATH=/music
-      # - PLAYER_PATH=/
-```
-
 ##### 2026.7.31 新增支持箭头音乐APP Subsonic 连接桥接器
 - 已测试支持音源 QQ音乐、网易云音乐、MA本地音乐
 - 其它音源播放不了欢迎反馈
@@ -131,6 +103,35 @@ services:
       - TZ=Asia/Shanghai
     network_mode: bridge 
 ```
+
+##### 现已支持洛雪服务端接入音乐源
+
+[https://github.com/hjy1728/mass-lxmusic-provider](https://github.com/xcq0607/lxserver)
+
+##### 洛雪服务端 docker compose 版安装（推荐）
+```
+version: '3'
+services:
+  lx-sync-server:
+    image: xcq0607/lxserver:latest
+    container_name: lx-sync-server
+    restart: unless-stopped
+    ports:
+      - "9527:9527"
+    volumes:
+      - ./data:/server/data
+      - ./logs:/server/logs
+      - ./cache:/server/cache
+      - ./music:/server/music
+    environment:
+      - NODE_ENV=production
+      # - FRONTEND_PASSWORD=123456
+      # - ENABLE_WEBPLAYER_AUTH=true
+      # - WEBPLAYER_PASSWORD=yourpassword
+      # - ADMIN_PATH=/music
+      # - PLAYER_PATH=/
+```
+
 ###  :speech_balloon: 参与贡献
 
 欢迎所有形式的贡献，包括但不限于：
