@@ -1,4 +1,4 @@
-"""云音乐元数据提供者 for Music Assistant UI (v1.9.8 发布版).
+"""云音乐元数据提供者 for Music Assistant UI (v2.0).
 获取最新版本 https://gitee.com/andychao2020/music-assistant-providers
 核心功能：优先从歌曲搜索结果提取专辑ID，精准匹配目标专辑 + 发行年份写入标签 + 精简日志
 """
@@ -6,15 +6,15 @@
 from __future__ import annotations
 
 import asyncio
-from json import JSONDecodeError
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 from datetime import datetime
+import re
 
 import aiohttp.client_exceptions
 from mashumaro import DataClassDictMixin
 
-from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.config_entries import ConfigActionResult, ConfigEntry
 from music_assistant_models.enums import (
     ConfigEntryType,
     ExternalID,
@@ -30,7 +30,10 @@ from music_assistant_models.media_items import (
     Track,
     UniqueList,
 )
-from music_assistant_models.errors import ResourceTemporarilyUnavailable
+from music_assistant_models.errors import (
+    ActionUnavailable,
+    ResourceTemporarilyUnavailable,
+)
 
 from music_assistant.controllers.cache import use_cache
 from music_assistant.helpers.throttle_retry import ThrottlerManager, throttle_with_retries
@@ -57,6 +60,21 @@ class ConfigKeys:
     ENABLE_IMAGES = "enable_images"
     API_URL = "api_url"
 
+# 一键动作
+ACTION_TRIGGER_SCAN = "trigger_scan_missing_artist_metadata"
+ACTION_TRIGGER_SCAN_ALL = "trigger_scan_all_artist_metadata"
+ACTION_TRIGGER_SCAN_ALL_TRACKS = "trigger_scan_all_track_metadata"
+
+# 后台任务统一提示文案（所有按钮复用）
+TASK_STARTED_HINT = "正在后台运行（设置▶︎系统▶︎后台任务）可查看进度"
+
+# framework 内置的 Scan missing artist metadata 任务 ID
+SCAN_TASK_ID = "metadata_missing_artist_metadata_scan_v2"
+# 插件自定义的"扫描全部艺术家"任务 ID
+SCAN_ALL_TASK_ID = "netease_metadata_scan_all_artists_v2"
+# 插件自定义的"扫描全部歌曲元数据"任务 ID
+SCAN_ALL_TRACKS_TASK_ID = "netease_metadata_scan_all_tracks_v2"
+
 # 正则表达式
 import re
 SOUNDTRACK_SUFFIX_PATTERN = re.compile(r'\s*(电视原声带|电影原声带|原声大碟|OST|Original Soundtrack)\s*', re.IGNORECASE)
@@ -65,9 +83,14 @@ COMMON_SUFFIX_PATTERN = re.compile(r'\s*\([^)]*\)|\s*\[[^]]*\]|\s*-\s*.*$')
 # 配置参数
 ARTIST_NAME_SEPARATORS = ['/', '\\', '|', ',', '；', ';', '+']
 CACHE_TTL = 86400 * 7
+# 实测 NCP Enhanced v4.40.1 + 网易云 API 阈值：
+#   2 req/s 串行 20 次稳如狗；30 并发瞬时 10 个后开始 405 限流
+#   限流冷却 60-90 秒（IP 维度黑名单）
+# 因此插件侧保守用 2 req/s，宁可慢不可触发限流
 API_RATE_LIMIT = 2
 API_RATE_PERIOD = 1
 ALBUM_IMAGE_PARAM = "?param=500y500"
+EMPTY_RESULT_MARKER = {"_empty_result": True}  # 标记"API 通了但无结果"，区别于 API 失败返回的 None
 
 # 数据模型定义
 @dataclass
@@ -76,6 +99,7 @@ class CloudMusicArtistDetail(DataClassDictMixin):
     name: str
     cover: str | None = None
     avatar: str | None = None
+    picUrl: str | None = None
     briefDesc: str | None = None
     musicBrainzId: str | None = None
 
@@ -188,7 +212,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
                 label="启用专辑元数据获取",
                 default_value=True,
                 required=False,
-                description="v1.9.8 发布版：优先从歌曲提取专辑ID + 发行年份写入标签",
+                description="优先从歌曲提取专辑ID + 发行年份写入标签",
             ),
             ConfigEntry(
                 key=ConfigKeys.ENABLE_TRACK_METADATA,
@@ -212,7 +236,59 @@ class CloudMusicMetadataProvider(MetadataProvider):
                 required=True,
                 default_value="http://localhost:3003",
             ),
+            ConfigEntry(
+                key=ACTION_TRIGGER_SCAN,
+                type=ConfigEntryType.ACTION,
+                label="刮削缺失的艺术家",
+                description="触发 Scan missing artist metadata 任务（会调用所有启用的元数据提供器）",
+                action=ACTION_TRIGGER_SCAN,
+            ),
+            ConfigEntry(
+                key=ACTION_TRIGGER_SCAN_ALL,
+                type=ConfigEntryType.ACTION,
+                label="刮削所有艺术家",
+                description="强制刷新全部艺术家的元数据（含已有图片的，逐个重新获取）",
+                action=ACTION_TRIGGER_SCAN_ALL,
+            ),
+            ConfigEntry(
+                key=ACTION_TRIGGER_SCAN_ALL_TRACKS,
+                type=ConfigEntryType.ACTION,
+                label="刮削所有歌曲",
+                description="强制刷新全部歌曲的元数据（含歌词/封面，逐个重新获取）",
+                action=ACTION_TRIGGER_SCAN_ALL_TRACKS,
+            ),
         )
+
+    async def handle_config_action(
+        self, action: str
+    ) -> tuple[ConfigEntry, ...] | ConfigActionResult | None:
+        """处理 provider 设置页中的按钮点击"""
+        # 所有按钮统一返回提示文案（hermes-studio 前端把 message 渲染为 toast）
+        if action == ACTION_TRIGGER_SCAN:
+            self.logger.debug("[云音乐元数据] 触发 Scan missing artist metadata 任务")
+            self.mass.tasks.run_background_task(
+                task_id=SCAN_TASK_ID,
+                name="Scan missing artist metadata",
+                handler=self.mass.metadata._scan_missing_artist_metadata,
+            )
+            return ConfigActionResult(message=TASK_STARTED_HINT)
+        if action == ACTION_TRIGGER_SCAN_ALL:
+            self.logger.debug("[云音乐元数据] 触发扫描全部艺术家任务")
+            self.mass.tasks.run_background_task(
+                task_id=SCAN_ALL_TASK_ID,
+                name="Scan all artist metadata",
+                handler=self._scan_all_artist_metadata,
+            )
+            return ConfigActionResult(message=TASK_STARTED_HINT)
+        if action == ACTION_TRIGGER_SCAN_ALL_TRACKS:
+            self.logger.debug("[云音乐元数据] 触发扫描全部歌曲任务")
+            self.mass.tasks.run_background_task(
+                task_id=SCAN_ALL_TRACKS_TASK_ID,
+                name="Scan all track metadata",
+                handler=self._scan_all_track_metadata,
+            )
+            return ConfigActionResult(message=TASK_STARTED_HINT)
+        raise ActionUnavailable(f"未知动作: {action}")
 
     async def handle_async_init(self) -> None:
         self.cache = self.mass.cache
@@ -223,12 +299,14 @@ class CloudMusicMetadataProvider(MetadataProvider):
         self.enable_track_metadata = self.config.get_value(ConfigKeys.ENABLE_TRACK_METADATA, True)
         self.enable_images = self.config.get_value(ConfigKeys.ENABLE_IMAGES, True)
 
-        self.throttler = ThrottlerManager(rate_limit=API_RATE_LIMIT, period=API_RATE_PERIOD)
+        # retry_attempts=1: 单次失败即放弃，避免重试加剧 IP 限流
+        # 失败的艺术家自然会被上层 catch 跳过，不影响整个 Scan
+        self.throttler = ThrottlerManager(rate_limit=API_RATE_LIMIT, period=API_RATE_PERIOD, retry_attempts=1, initial_backoff=10)
 
         if not self.api_url:
             self.logger.error("[云音乐元数据] API地址未配置，插件将无法正常工作")
         else:
-            self.logger.info("[云音乐元数据] v1.9.8 发布版初始化完成")
+            self.logger.info("[云音乐元数据] v2.0 初始化完成")
 
     async def get_artist_metadata(self, artist: Artist) -> MediaItemMetadata | None:
         self.logger.debug("[网易云] get_artist_metadata 被调用: %s", artist.name)
@@ -247,7 +325,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
                 limit=1
             )
             
-            if not search_data or not search_data.get("result", {}).get("artists"):
+            if not search_data or search_data.get("_empty_result") or not search_data.get("result", {}).get("artists"):
                 self.logger.debug("[云音乐元数据] 艺术家匹配失败: %s (未找到相关结果)", cleaned_artist_name)
                 return None
             
@@ -489,7 +567,114 @@ class CloudMusicMetadataProvider(MetadataProvider):
         valid_images = [img for img in artist.images if img.path and img.type == ImageType.THUMB]
         return len(valid_images) > 0
 
-    @use_cache(CACHE_TTL, persistent=True, cache_none=False)
+    async def _iter_all_library_items(
+        self,
+        controller,
+        item_kind: str,
+        page_size: int = 25,
+    ) -> list:
+        """分页遍历库内全部 items，失败时记日志并中断。
+
+        item_kind 只用于日志（如"艺术家"/"歌曲"）。
+        返回所有成功拉取的 item；上层再自行按需处理。
+        """
+        all_items: list = []
+        offset = 0
+        while True:
+            try:
+                batch = await controller.get_library_items_by_query(
+                    limit=page_size,
+                    offset=offset,
+                    order_by="sort_name",
+                    collapse_collections=False,
+                )
+            except Exception as err:
+                self.logger.warning(
+                    "[云音乐元数据] 拉取%s列表失败(offset=%s): %s",
+                    item_kind, offset, err,
+                )
+                break
+            if not batch:
+                break
+            all_items.extend(batch)
+            offset += page_size
+            if len(batch) < page_size:
+                break
+        return all_items
+
+    async def _scan_all_artist_metadata(self) -> None:
+        """强制刷新全部艺术家的元数据（含已有图片/描述的，逐个重新获取）。
+
+        参考官方 Scan missing artist metadata 任务，但遍历所有艺术家并
+        force_refresh=True，确保每个艺术家都重新走一遍元数据提供器。
+        """
+        from music_assistant.controllers.tasks.context import (
+            report_current_task_failure,
+            update_current_task_progress_from_index,
+            update_current_task_progress_text,
+        )
+
+        update_current_task_progress_text("正在查询全部艺术家...")
+        artists_ctrl = self.mass.music.artists
+        all_artists: list[Artist] = await self._iter_all_library_items(
+            artists_ctrl, "艺术家", page_size=25
+        )
+        if not all_artists:
+            update_current_task_progress_text("没有艺术家需要刷新")
+            return None
+
+        total = len(all_artists)
+        update_current_task_progress_text(f"共 {total} 位艺术家，开始强制刷新...")
+        for index, artist in enumerate(all_artists, 1):
+            try:
+                update_current_task_progress_from_index(
+                    index, total, f"刷新艺术家 {index}/{total}: {artist.name}",
+                )
+                if isinstance(artist, ItemMapping):
+                    artist = await artists_ctrl.artist_from_item_mapping(artist)
+                await self.mass.metadata._update_artist_metadata(artist, force_refresh=True)
+            except Exception as err:
+                report_current_task_failure(f"{artist.name}: {err}")
+                self.logger.warning("[云音乐元数据] 刷新艺术家 %s 失败: %s", artist.name, err)
+        update_current_task_progress_text(f"全部 {total} 位艺术家刷新完成")
+        return None
+
+    async def _scan_all_track_metadata(self) -> None:
+        """强制刷新全部歌曲元数据（含歌词/封面，逐个重新获取）。
+
+        仿照 _scan_all_artist_metadata，遍历库内所有歌曲并
+        force_refresh=True 逐个重新走一遍元数据提供器。
+        """
+        from music_assistant.controllers.tasks.context import (
+            report_current_task_failure,
+            update_current_task_progress_from_index,
+            update_current_task_progress_text,
+        )
+
+        update_current_task_progress_text("正在查询全部歌曲...")
+        tracks_ctrl = self.mass.music.tracks
+        all_tracks: list[Track] = await self._iter_all_library_items(
+            tracks_ctrl, "歌曲", page_size=50
+        )
+        if not all_tracks:
+            update_current_task_progress_text("没有歌曲需要刷新")
+            return None
+
+        total = len(all_tracks)
+        update_current_task_progress_text(f"共 {total} 首歌曲，开始强制刷新...")
+        for index, track in enumerate(all_tracks, 1):
+            try:
+                update_current_task_progress_from_index(
+                    index, total, f"刷新歌曲 {index}/{total}: {track.name}",
+                )
+                await self.mass.metadata._update_track_metadata(track, force_refresh=True)
+            except Exception as err:
+                report_current_task_failure(f"{track.name}: {err}")
+                self.logger.warning("[云音乐元数据] 刷新歌曲 %s 失败: %s", track.name, err)
+        update_current_task_progress_text(f"全部 {total} 首歌曲刷新完成")
+        return None
+
+    @use_cache(CACHE_TTL, persistent=True, cache_none=True)
     @throttle_with_retries
     async def _get_data(self, endpoint: str, **kwargs: Any) -> dict[str, Any] | None:
         if not self.api_url:
@@ -500,15 +685,23 @@ class CloudMusicMetadataProvider(MetadataProvider):
             async with self.mass.http_session.get(
                 url, params=kwargs, ssl=False, timeout=aiohttp.ClientTimeout(total=5)
             ) as response:
-                if response.status == 429:
-                    backoff_time = int(response.headers.get("Retry-After", 5))
+                if response.status in (429, 405):
+                    # 429 标准限流，405 是网易云 API 反爬伪装成 "Method Not Allowed"
+                    # 实测限流冷却 60-90 秒（IP 维度黑名单），给足冷却时间
+                    backoff_time = int(response.headers.get("Retry-After", 90))
                     raise ResourceTemporarilyUnavailable("API限流", backoff_time=backoff_time)
                 if response.status in (502, 503):
                     raise ResourceTemporarilyUnavailable("服务器临时不可用", backoff_time=10)
                 if response.status in (400, 401, 404):
                     return None
                 response.raise_for_status()
-                return await response.json(loads=json_loads)
+                result = await response.json(loads=json_loads)
+                # 把"API 通了但 result 是空集合"包装成 marker，让缓存层能缓存避免重复查询
+                if isinstance(result, dict) and isinstance(result.get("result"), dict):
+                    res = result["result"]
+                    if all(not res.get(k) for k in ("artists", "albums", "songs", "playlists")):
+                        return EMPTY_RESULT_MARKER
+                return result
         except ResourceTemporarilyUnavailable:
             raise
         except Exception:
@@ -526,10 +719,12 @@ class CloudMusicMetadataProvider(MetadataProvider):
             metadata.description = ""
 
         metadata.genres = {artist_search.genre} if artist_search.genre else set()
-        
         if self.enable_images:
             metadata.images = UniqueList()
-            pic_url = artist_detail.avatar or artist_detail.cover if use_detail else artist_search.picUrl
+            if use_detail:
+                pic_url = artist_detail.avatar or artist_detail.picUrl or artist_search.picUrl or artist_detail.cover
+            else:
+                pic_url = artist_search.picUrl
             if pic_url:
                 metadata.images.append(
                     MediaItemImage(type=ImageType.THUMB, path=pic_url, provider=self.instance_id, remotely_accessible=True)
