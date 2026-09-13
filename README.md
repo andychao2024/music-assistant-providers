@@ -6,7 +6,7 @@
 
 [https://github.com/hjy1728/mass-lxmusic-provider](https://github.com/xcq0607/lxserver)
 
-洛雪服务端 docker compose 版安装（推荐）
+##### 洛雪服务端 docker compose 版安装（推荐）
 ```
 version: '3'
 services:
