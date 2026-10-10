@@ -3,12 +3,12 @@
   "domain": "lxmusic",
   "stage": "experimental",
   "name": "LX Music (洛雪音乐服务端)",
-  "description": "将 LX Music (洛雪音乐) Docker 服务端作为 Music Assistant 的音乐源，支持跨音源搜索、播放与歌词。浏览支持查看排行榜和广场歌单。https://github.com/xcq0607/lxserver",
+  "description": "将 LX Music (洛雪音乐) Docker 服务端作为 Music Assistant 的音乐源，支持跨音源搜索、播放与歌词。浏览支持查看排行榜和广场歌单，并提供每日推荐、推荐新曲、推荐歌单与洛雪电台。红心收藏与洛雪双向同步。https://github.com/xcq0607/lxserver",
   "codeowners": ["@billy", "@andychao2024"],
   "requirements": ["aiohttp>=3.8.0"],
   "documentation": "https://github.com/andychao2024/music-assistant-providers",
   "multi_instance": true,
   "has_setup_flow": true,
-  "version": "1.2.0",
-  "credits": ["andychao 修改 - 适配 MA 2.10.X"]
+  "version": "1.3.3",
+  "credits": ["andychao 修改 - 适配 MA 2.10.X，v1.3.3：红心(洛雪收藏)双向同步——洛雪端加/取消红心随库同步进入/移出 MA 收藏，MA 里点/取消红心实时写回洛雪 loveList；新增「同步洛雪红心收藏」开关(默认开)"]
 }

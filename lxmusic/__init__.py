@@ -4,8 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import random
 import re
+import secrets
+import time
 from collections.abc import AsyncGenerator, Sequence
 from typing import TYPE_CHECKING, Any
 
@@ -13,6 +17,7 @@ import aiohttp
 
 from music_assistant_models.config_entries import (
     ConfigEntry,
+    ConfigValueOption,
     ConfigValueType,
     ProviderConfig,
 )
@@ -34,12 +39,21 @@ from music_assistant_models.media_items import (
     MediaItemMetadata,
     Playlist,
     ProviderMapping,
+    RecommendationFolder,
     SearchResults,
     Track,
 )
 from music_assistant_models.streamdetails import StreamDetails
 from music_assistant_models.errors import LoginFailed
+from music_assistant_models.unique_list import UniqueList
 from music_assistant.models.music_provider import MusicProvider
+
+# The radio playlist reads MA's "filter recently played" helper, which lives in
+# an internal module and may be missing across versions, so import it softly.
+try:
+    from music_assistant.helpers.track_filter import filter_tracks as _ma_filter_tracks
+except Exception:  # noqa: BLE001
+    _ma_filter_tracks = None
 
 if TYPE_CHECKING:
     from music_assistant_models.provider import ProviderManifest
@@ -54,14 +68,20 @@ CONF_USERNAME = "username"
 CONF_PASSWORD = "password"
 CONF_DEFAULT_SOURCE = "default_source"
 CONF_SEARCH_SOURCES = "search_sources"
-# 2026-09-04:导入排行榜开关(默认开启)。
-# 关闭后 ``get_library_playlists`` 不再 yield 51 个 LX 排行榜。
-# 已存在的虚拟歌单会保留在 DB,但 sync 不会再次 yield,等同冻结。
+# When disabled, leaderboard playlists are no longer yielded by the library sync.
 CONF_IMPORT_LEADERBOARDS = "import_leaderboards"
-# 2026-09-06 Task #76: 用户要求把排行榜和广场歌单拆成两个独立开关。
-# 关闭后 ``get_library_playlists`` 不再 yield 各 tag top N 的广场歌单
-# (per_tag=5,典型 25~300 个,取决于 tag 数)。
+# When disabled, square/discover playlists are no longer yielded by the sync.
 CONF_IMPORT_SQUARE = "import_square_playlists"
+# Radio playlist rotates on time buckets instead of randomly on each open.
+CONF_RADIO_INTERVAL = "radio_refresh_minutes"
+# Per-slot source override for the daily / new-song recommendation rows.
+CONF_DAILY_SOURCE = "daily_source"
+CONF_NEWSONG_SOURCE = "newsong_source"
+# Two-way love-list (hearted songs) sync, enabled by default.
+# On: loveList is synced into the MA library as favorites by the built-in
+#     library sync, and MA favorite toggles are written back to lxserver.
+# Off: loveList is no longer synced; items already in the library are kept.
+CONF_SYNC_LOVE_LIST = "sync_love_list"
 
 SOURCE_NAMES = {
     "kw": "酷我",
@@ -73,6 +93,99 @@ SOURCE_NAMES = {
 
 QUALITY_ORDER = ["flac", "320k", "128k"]
 
+# --------------------------------------------------------------------------- #
+# Recommendations and the dynamic radio playlist.
+#
+# All data comes from lxserver itself: the Subsonic layer (getDailySongs /
+# getSongsByGenre / getAlbumList2) plus the frontend APIs /api/music/leaderboard/list
+# and /api/music/songList/list. No ncm-api or third-party dependency.
+# --------------------------------------------------------------------------- #
+# Subsonic mount point; port 0 means the main server port, path is fixed to
+# /rest unless the server overrides it (see CONF_SUBSONIC_PATH).
+SUBSONIC_PATH_DEFAULT = "/rest"
+SUBSONIC_CLIENT = "lxmusic-ma"
+SUBSONIC_VERSION = "1.16.1"
+# Subsonic auth: t = md5(password + salt). A random salt keeps plaintext
+# passwords out of URL logs.
+SUBSONIC_SALT_BYTES = 8
+
+# Cache category. This MA release has no CACHE_CATEGORY_RECOMMENDATIONS, so
+# pick an unused id above the ones taken by the metadata side.
+CACHE_CATEGORY_RECOMMENDATIONS = 103
+# Bump when the cached shape changes so stale entries are dropped.
+_RECO_CACHE_VERSION = "v3"
+
+# Cache TTLs per recommendation slot. Daily rows are shuffled per calendar
+# day, so their TTL is generous to stay stable within a day.
+_RECO_TTL_DAILY = 6 * 60 * 60
+_RECO_TTL_NEWSONG = 30 * 60
+_RECO_TTL_PLAYLISTS = 60 * 60
+_RECO_TTL_RADIO = 5 * 60
+
+# Recommendation item ids, also used as cache key prefixes.
+RECO_DAILY = "daily_songs"
+RECO_NEW = "recommended_new_songs"
+RECO_PLAYLISTS = "recommended_playlists"
+RECO_RADIO = "recommended_radios"
+
+# Legacy single-board ids kept for fallback call sites; the main path mixes
+# several boards per source (see NEWSONG_BOARDS_BY_SOURCE).
+NEWSONG_BANGID_BY_SOURCE = {"wy": "3779629"}
+NEWSONG_FALLBACK_SOURCES = ("wy", "tx", "kw", "kg", "mg")
+
+# Cap tracks per album: covers are album art, so same-album rows look
+# duplicated in the UI.
+DAILY_MAX_PER_ALBUM = 3
+DAILY_TARGET = 60
+NEWSONG_MAX_PER_ALBUM = 3
+NEWSONG_TARGET = 100
+# Daily rows mix several official boards of one platform instead of the
+# server-side getDailySongs, which only draws from a handful of albums and
+# therefore repeats the same cover. Defaults are configurable per platform.
+RECO_SOURCE_DEFAULT = "kw"
+# Dropdown options, in display order.
+RECO_SOURCES = ("kw", "kg", "wy", "mg", "tx")
+# Boards mixed per platform. Board names differ across platforms, so they are
+# resolved by exact match first and fuzzy match second; a server-side rename
+# then degrades one board instead of the whole slot.
+DAILY_BOARDS_BY_SOURCE: dict[str, tuple[str, ...]] = {
+# Kuwo has no plain "new/hot" board; use the closest equivalents plus the
+# flagship chart to grow the pool.
+    "kg": ("飙升榜", "TOP500", "酷狗音乐人原创榜", "ACG新歌榜", "抖音热歌榜"),
+    "wy": ("飙升榜", "新歌榜", "原创榜", "热歌榜"),
+    "kw": ("飙升榜", "新歌榜", "热歌榜", "流行趋势榜"),
+    "mg": ("新歌榜", "热歌榜", "原创榜", "音乐风向榜"),
+    "tx": ("飙升榜", "新歌榜", "热歌榜", "流行指数榜"),
+}
+# New-song rows only mix "new" oriented boards (new / rising / original),
+# never hot or classic charts. Mixing several boards roughly doubles cover
+# diversity compared to a single new-song board.
+NEWSONG_BOARDS_BY_SOURCE: dict[str, tuple[str, ...]] = {
+    "kw": ("新歌榜", "飙升榜", "网红新歌榜", "腾讯音乐人原创榜"),
+    "kg": ("飙升榜", "ACG新歌榜", "古风新歌榜", "酷狗音乐人原创榜"),
+    "wy": ("新歌榜", "飙升榜", "原创榜", "欧美新歌榜"),
+    "mg": ("新歌榜", "原创榜", "音乐风向榜"),
+    "tx": ("新歌榜", "飙升榜", "腾讯音乐人原创榜", "综艺新歌榜"),
+}
+# Fuzzy board keywords used when a platform's configured boards all come back empty.
+DAILY_FALLBACK_KEYWORDS = ("热歌", "新歌", "飙升")
+NEWSONG_FALLBACK_KEYWORDS = ("新歌", "飙升", "原创")
+
+
+# Radio candidates come from real leaderboards. The Subsonic getSongsByGenre
+# implementation ignores the genre argument and returns the same handful of
+# songs, so picking random boards (every platform has dozens) is what actually
+# provides variety.
+RADIO_BOARD_PICKS = 6
+RADIO_SONGS_PER_BOARD = 10
+# Item id of the dynamic radio playlist, dispatched through get_playlist*.
+RADIO_PLAYLIST_ITEM_ID = "list:fm:radio"
+RADIO_NAME = "洛雪电台"
+# Rotation interval bounds in minutes, exposed as a provider config entry.
+RADIO_INTERVAL_DEFAULT = 60
+RADIO_INTERVAL_MIN = 5
+RADIO_INTERVAL_MAX = 1440
+
 SUPPORTED_FEATURES = {
     ProviderFeature.SEARCH,
     ProviderFeature.BROWSE,
@@ -83,6 +196,10 @@ SUPPORTED_FEATURES = {
     ProviderFeature.ARTIST_ALBUMS,
     ProviderFeature.ARTIST_TOPTRACKS,
     ProviderFeature.LYRICS,
+    ProviderFeature.RECOMMENDATIONS,
+# Declaring this makes MA call set_favorite when the user hearts/unhearts a
+# track so the state is written back to the lxserver love list.
+    ProviderFeature.FAVORITE_TRACKS_EDIT,
 }
 
 
@@ -96,18 +213,17 @@ async def setup(
 
 
 def _normalize_lx_interval(value: Any) -> str:
-    """把任意 interval 值规范成 lxserver 歌词接口需要的 "MM:SS" 字符串。
+    """Normalize any interval value into the "MM:SS" text the lyric API wants.
 
-    BUG #102 (2026-09-07): lxserver kg/wy SDK 都按字符串 split,纯数字
-    秒数 / float / None 都会让 SDK 在 ``interval.split(':')`` 或
-    ``interval.includes('.')`` 时抛错或丢精度。这里集中处理:
+    The source SDKs split interval as a string, so a bare number, a float or
+    None either raises or loses precision. Handling it in one place:
 
-    - 已为 ``"MM:SS"`` / ``"MM:SS.xxx"`` → 原样返回
-    - 数字 / 数字字符串 (秒) → 转成 ``"MM:SS"``
-    - 空 / None / 非法 → 返回 ``""`` (服务端 SDK 自己会用 0 兜底)
+    - already "MM:SS" or "MM:SS.xxx" -> returned unchanged
+    - a number, or a string of seconds -> formatted as "MM:SS"
+    - empty, None or unparseable -> "", which the server SDKs treat as zero
 
-    与 lxmusic 自己的字段约定对齐 (lxserver 搜索结果是 ``"04:28"`` 字符串,
-    但 MA track.duration 是秒数, 可能传进来是数字)。
+    Search results already use "MM:SS" while MA durations are seconds, so both
+    forms can arrive here.
     """
     if value is None or value == "":
         return ""
@@ -116,11 +232,11 @@ def _normalize_lx_interval(value: Any) -> str:
         return ""
     if ":" in s:
         return s
-    # 纯数字 (秒) → MM:SS
+    # bare number (seconds) -> MM:SS
     try:
         total = int(float(s))
     except (TypeError, ValueError):
-        return s  # 给服务端自己处理, 至少不抛
+        return s  # let the server deal with it rather than raising
     if total < 0:
         return ""
     m, sec = divmod(total, 60)
@@ -128,33 +244,30 @@ def _normalize_lx_interval(value: Any) -> str:
 
 
 class LxMusicProvider(MusicProvider):
-    """Provide LX Music (洛雪音乐服务端) as a music source."""
+    """Provide an LX Music server as a music source."""
 
     _http_session: aiohttp.ClientSession | None = None
     _token: str | None = None
 
     async def handle_async_init(self) -> None:
-        """Handle async setup of the provider.
+        """Set up the provider.
 
-        关键：setup flow 添加时，框架 (flows.py:_finish_provider_setup) 把表单值放进
-        ``setup_data`` 字段（加密），``values`` 字段留空 dict。所以必须用
-        ``self.get_setup_value(...)``（从 setup_data 解密读取）；用 ``self.config.get_value(...)``
-        只读 ``self.config.values``，永远拿不到 setup flow 填的字段——这就是 2026-09-04
-        用户反复看到「400 Missing username or password」的真正根因（settings.json 里
-        压根没有 lxmusic 条目，因为 handle_async_init 抛 LoginFailed 后整个
-        _create_provider_instance 被回滚删除）。
+        The setup flow stores form values in the encrypted ``setup_data`` field
+        and leaves ``values`` empty, so every option must be read through
+        ``get_setup_value``; ``config.get_value`` would always return None and
+        the provider would fail with a misleading login error.
         """
         self._server_url = str(self.get_setup_value(CONF_SERVER_URL) or "http://localhost:9527").rstrip("/")
         self._username = self.get_setup_value(CONF_USERNAME) or "admin"
         self._password = self.get_setup_value(CONF_PASSWORD) or ""
         self._default_source = self.get_setup_value(CONF_DEFAULT_SOURCE) or "wy"
-        # 2026-09-04:导入排行榜开关,默认 True。关闭后 get_library_playlists
-        # 不再 yield 51 个 LX 排行榜。已存在的虚拟歌单保留在 DB,sync 不再 yield。
-        # get_setup_value 在 setup flow 第一次保存时是 None,这里 ``or True`` 保证默认开。
+        # Leaderboard import toggle. Defaults to on; existing playlists stay in
+        # the database when turned off, they are just no longer re-yielded.
+        # get_setup_value returns None on the first save, so force the default.
         self._import_leaderboards = bool(
             self.get_setup_value(CONF_IMPORT_LEADERBOARDS) or True
         )
-        # 2026-09-06 Task #76: 拆分独立开关 — 广场歌单导入。
+        # Square/discover playlist import toggle, independent of the above.
         self._import_square = bool(
             self.get_setup_value(CONF_IMPORT_SQUARE) or True
         )
@@ -162,9 +275,13 @@ class LxMusicProvider(MusicProvider):
         self._search_sources = [
             s.strip() for s in raw_sources.split(",") if s.strip()
         ] or ["wy"]
-        # 2026-09-04 诊断:确认 get_setup_value 真的拿到了 setup flow 填的字段。
-        # 注意:必须放在 _search_sources 赋值之后,否则 LOGGER.warning 引用
-        # self._search_sources 会触发 AttributeError,正好是 UI 上看到的那个错误。
+        # The radio interval is only logged here; the effective value is read
+        # per use by _radio_interval_seconds(), so config changes apply at once.
+        LOGGER.info(
+            "lxmusic: radio rotation interval %d minutes", self._radio_interval_minutes()
+        )
+        # Must stay after _search_sources is set: this line references it, and
+        # logging it earlier would raise AttributeError during init.
         LOGGER.info(
             "lxmusic: init server=%s user=%s sources=%s default=%s",
             self._server_url,
@@ -172,135 +289,127 @@ class LxMusicProvider(MusicProvider):
             self._search_sources,
             self._default_source,
         )
-        # 缓存已解析的 Track 与原始 item（供 get_track / get_stream_details 复用）
+        # Parsed tracks and their raw source items, reused by get_track / get_stream_details.
         self._track_cache: dict[str, Track] = {}
         self._raw_cache: dict[str, dict[str, Any]] = {}
-        # BUG #100 (2026-09-07): 歌词 in-memory 缓存, key = prov_track_id
-        # 不持久化到 db (重启后重拉)。值 = lrc 文本 或 None (拉过但没歌词,
-        # 缓存 None 避免重复调 lxserver 浪费 RTT)。
+        # Lyric cache keyed by provider track id. Not persisted; a None value
+        # records "fetched, no lyrics" so the server is not hit again.
         self._lyrics_cache: dict[str, str | None] = {}
-        # 歌手 / 专辑 / 歌单缓存：记录真实 ID 与名称，供详情 / 曲目接口做兜底回查
+        # Artist / album / playlist metadata used to look details back up by id.
         self._artist_cache: dict[str, dict[str, Any]] = {}
         self._album_cache: dict[str, dict[str, Any]] = {}
         self._playlist_cache: dict[str, list[dict[str, Any]]] = {}
-        # 广场/网络歌单元数据缓存：item_id -> {name, source, id, img, ...}
-        # 供 get_playlist/_build_square_playlist 回填歌单名与封面
+        # Square/discover playlist metadata, used to fill in names and covers.
         self._square_meta: dict[str, dict[str, Any]] = {}
-        # BUG #83 (2026-09-06): tags API 缓存 (raw_tags, parent_id -> [sub_id])
-        # BUG #88 (2026-09-06): 改 (raw_tags, hotTag list) — LX /songList/list 不按 tag 过滤,父 tag 展开会重复
-        # 顶层 BrowseFolder 列表 + 子层判断 parent/sub_tag 都基于这份缓存
-        # BUG #88 (2026-09-06): 改为 (raw tags list, hotTag list)
+        # Square tag cache (raw tags, hot tags). The server does not filter
+        # /songList/list by tag, so expanding parent tags would duplicate
+        # results; both the top-level browse folders and the sub-tag decision
+        # are derived from this single cache.
         self._square_tags_cache: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None
-        # 按专辑 aid 缓存已解析的 Track（搜索/歌手页解析过的同专辑歌曲，
-        # 点击专辑时直接可用，避免依赖 albumId 或回搜失败导致专辑无曲目）
+        # Tracks already parsed during search/artist pages, keyed by album id,
+        # so opening an album does not depend on a follow-up lookup.
         self._album_tracks: dict[str, list[Track]] = {}
         self._user_lists_cache: dict[str, Any] | None = None
-        # BUG #34 (2026-09-04) 修复: 用户在 lxserver 端新建/删除/重命名歌单后,
-        # MA 不会自动发现——_user_lists_cache 被永久缓存,后续所有
-        # get_library_playlists 调用都返回 MA 启动那一刻的快照。
-        # 加 TTL 让 sync 任务定期重新拉取。60 秒足够短,能捕获新歌单;
-        # 又不会让每次 get_playlist / search 都打 lxserver。
+        # The user list snapshot needs a TTL: without one, playlists created,
+        # renamed or deleted on the lxserver side never show up in MA. 60s is
+        # short enough to catch changes without hitting the server on every call.
         self._user_lists_cache_time: float = 0.0
         self._user_lists_cache_lock = asyncio.Lock()
         self._USER_LISTS_CACHE_TTL: float = 60.0
-        # 用户歌单歌曲补封面缓存: (source, name, singer) -> pic URL 或 None
-        # 避免每次打开用户歌单都重搜同一首歌
+        # Cover backfill cache for user playlists, keyed by (source, name, singer),
+        # so reopening a playlist does not re-search every track.
         self._pic_enrich_cache: dict[tuple[str, str, str], str | None] = {}
-        # 跨平台重搜 songmid 缓存: (source, name, singer) -> songmid 或 None
-        # 避免重复用同一 (歌名, 歌手) 在同一平台反复搜
+        # Cross-platform songmid resolution cache, same key, avoids repeat searches.
         self._songmid_resolve_cache: dict[tuple[str, str, str], str | None] = {}
-        # 虚拟歌单元数据缓存 (排行榜 + 广场精选): list:board:... / list:songlist:...
-        # 在 get_library_playlists yield 时填充, get_playlist() 复用,避免 MA 二次访问
-        # 元数据时再去打 lxserver。
+        # Metadata for virtual playlists (leaderboards + square picks), filled
+        # while yielding the library so get_playlist does not call the server again.
         self._virtual_meta: dict[str, dict[str, Any]] = {}
-        # 广场精选歌单每个 tag 取 top N(防止歌单总数爆炸)。排行榜不受限,全部导入。
+        # Square playlists per tag, keeps the total playlist count sane.
         self._LEADERBOARD_TOPN: int = 5
+        # Board name -> bangid. Ids are handed out by the server and rarely
+        # change, so one lookup per process is enough.
+        self._board_id_cache: dict[str, str | None] = {}
+        # Radio rotates on time buckets: bucket = now / interval. Within one
+        # bucket the pool and shuffle order are stable, across buckets they change.
+        # Only the last bucket number is kept, for logging.
+        self._radio_bucket: int = -1
 
-        # 防御性校验：LX 服务端对空 username 或 password 返回
-        # 400 "Missing username or password"，日志/UI 上看不出是配置缺失。
-        # 这里提前抛错，让用户看到清晰提示去 MA 设置里补填密码。
-        # 2026-09-04 用户报告即使 setup_flow.py 标了 required=True，仍然 400，
-        # 怀疑是前端 SECURE_STRING 渲染 / 表单提交时丢了 password 字段。
+        # Fail early with a clear message: the server answers an empty username
+        # or password with a bare "400 Missing username or password", which gives
+        # no hint that a provider option is missing.
         if not str(self._username).strip():
             raise LoginFailed(
-                "LX Music 用户名为空。请到 MA 设置 → Providers → LX Music → 配置 "
-                "里填写 LX 服务端的登录用户名。"
+                "LX Music username is empty. Set the lxserver login username in "
+                "MA settings -> Providers -> LX Music -> Configure."
             )
         if not str(self._password):
             raise LoginFailed(
-                "LX Music 密码为空。请到 MA 设置 → Providers → LX Music → 配置 "
-                "里填写 LX 服务端的登录密码（在 lxserver 后台可设置/修改）。"
+                "LX Music password is empty. Set the lxserver login password in "
+                "MA settings -> Providers -> LX Music -> Configure."
             )
 
         await self._login()
 
-        # 2026-09-04 启动后强制重跑 sync 任务。
-        # 原因:MA 默认 sync 周期是 hourly(every=12),也就是 12 小时一次。
-        # 用户改了 _LEADERBOARD_TOPN / 广场歌单命名后,等不到 sync 重跑,
-        # UI 看不出新效果。
+        # Force a sync shortly after startup. The default provider sync runs
+        # every 12 hours, so config or naming changes would otherwise stay
+        # invisible in the UI for a long time.
         #
-        # 之前用的是 schedule_provider_sync (只 schedule,10s 后才 run),
-        # 但实测发现该调用在 MA 启动早期可能不生效 (coroutine 跑得太早,
-        # config controller / providers 列表还没就绪),导致 sync 不会执行。
-        # 改用 start_sync:内部先 schedule 再立刻 run_task,绕过 initial_delay
-        # 不稳定的问题。同时先 await 一段缓冲,等 MA 完全启动完,避免同样问题。
+        # start_sync is used instead of schedule_provider_sync: scheduling alone
+        # can be a no-op this early in startup, while start_sync schedules and
+        # then runs the task immediately.
         #
-        # catch 所有异常 —— sync 失败不应拖死 handle_async_init,
-        # 否则 provider 加载失败导致用户在 UI 上看不到 LX provider。
+        # Swallow errors: a failed sync must not break handle_async_init, which
+        # would hide the provider from the UI entirely.
         try:
             async def _delayed_sync() -> None:
-                # 等 MA 完全启动 + 一些 provider 完成 sync 调度,
-                # 再强制重跑 LX 歌单同步 (10s 通常够)。
+                # Give MA a moment to finish starting before syncing. Tracks are
+                # included so the love list lands in MA favorites right away
+                # instead of waiting for the 12-hour library sync cycle.
                 await asyncio.sleep(10)
                 try:
                     await self.mass.music.start_sync(
-                        media_types=[MediaType.PLAYLIST],
+                        media_types=[MediaType.PLAYLIST, MediaType.TRACK],
                         providers=[self.instance_id],
                     )
                 except Exception as err:  # noqa: BLE001
-                    LOGGER.warning("lxmusic: 启动后强制 sync 失败: %s", err)
+                    LOGGER.warning("lxmusic: forced post-startup sync failed: %s", err)
 
             self.mass.create_task(_delayed_sync())
         except Exception as err:  # noqa: BLE001
-            LOGGER.warning("lxmusic: 调度启动 sync 失败: %s", err)
+            LOGGER.warning("lxmusic: failed to schedule post-startup sync: %s", err)
 
-        # 注:2026-09-04 引入的双层名字 cleanup 已完成(单层化为 LX ·<tag>:<name>),
-        # DB 残留清空,后续启动每次都跑 cleaned=0 是浪费 IO,这里不再调度。
+        # The one-off cleanup of legacy two-layer playlist names is done and is
+        # not scheduled again: it would only scan the database for nothing.
 
-        # BUG #94 (2026-09-07): 启动后后台预 fill 排行榜
-        # 161 个榜单 + pic 串行拉取总耗时 ~25s,browse 子目录点击如果首次
-        # 才触发 fill,UI 会空白很久,体感"读不出歌单"。改为 handle_async_init
-        # 里后台跑一次,启动后几秒就开始,~30s 内把 _virtual_meta 填好,
-        # 届时用户首次点"排行榜"就是毫秒级返回(走缓存守卫)。
-        # catch 所有异常 —— 预 fill 失败不应拖死 handle_async_init,
-        # 否则 provider 加载失败导致用户在 UI 上看不到 LX provider。
+        # Warm the leaderboard metadata in the background after startup. Filling
+        # ~160 boards takes about 25s; without this the first browse click waits
+        # for it and looks like a hang.
+        # Swallow errors: a failed prefetch must not break handle_async_init.
         try:
             async def _prefetch_leaderboards() -> None:
-                # 等 MA 主循环起来 + 内部请求协程池就绪再开,避免启动
-                # 早期跟其他 sync 抢资源;3s 缓冲实测足够。
+                # Short delay so the prefetch does not compete with other work
+                # scheduled during startup.
                 await asyncio.sleep(3)
                 if not getattr(self, "_import_leaderboards", True):
-                    LOGGER.debug("lxmusic: 排行榜开关关闭,跳过预 fill")
+                    LOGGER.debug("lxmusic: leaderboard toggle off, skipping prefetch")
                     return
                 try:
                     await self._fill_leaderboards([])
-                    LOGGER.info("lxmusic: 排行榜后台预 fill 完成")
+                    LOGGER.info("lxmusic: leaderboard prefetch finished")
                 except Exception as err:  # noqa: BLE001
-                    LOGGER.warning("lxmusic: 排行榜后台预 fill 失败: %s", err)
+                    LOGGER.warning("lxmusic: leaderboard prefetch failed: %s", err)
 
             self.mass.create_task(_prefetch_leaderboards())
         except Exception as err:  # noqa: BLE001
-            LOGGER.warning("lxmusic: 调度排行榜预 fill 失败: %s", err)
+            LOGGER.warning("lxmusic: failed to schedule leaderboard prefetch: %s", err)
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
-        """Return Config entries to setup this provider.
+        """Return config entries to set up this provider.
 
-        2026-09-04 BUG #22 修复:setup flow 把表单值放进 setup_data(values 留空),
-        再进入设置页面时如果 default_value 还用字面量,UI 上看到的就是初始默认值,
-        用户不知道真实值是多少;若误点保存还会用默认值覆盖 setup_data 的真实值,
-        下次启动 handle_async_init 拿到错误 username/password 而登录失败。
-        因此 default_value 必须从 self.get_setup_value(...) 读取已存值,
-        没有时再 fallback 到字面量。
+        ``default_value`` must be read back through ``get_setup_value``: the
+        setup flow stores submitted values in ``setup_data`` and leaves
+        ``values`` empty, so a literal default would both mislead the user and
+        silently overwrite the real value when the form is saved again.
         """
         return (
             ConfigEntry(
@@ -325,8 +434,8 @@ class LxMusicProvider(MusicProvider):
                 type=ConfigEntryType.SECURE_STRING,
                 label="密码",
                 required=True,
-                # SECURE_STRING 在前端会以掩码形式回显(虽然从 setup_data 拿到的是明文)
-                # 拿不到时回退到空串,让用户重新输入。
+                # SECURE_STRING is echoed masked; fall back to empty so the user
+                # re-enters it when the stored value is unavailable.
                 default_value=str(self.get_setup_value(CONF_PASSWORD) or ""),
             ),
             ConfigEntry(
@@ -347,9 +456,8 @@ class LxMusicProvider(MusicProvider):
                 required=False,
                 description="搜索时轮询的音源列表，逗号分隔",
             ),
-            # 2026-09-06 BUG #80: 排行榜 / 广场歌单已经从 #/library/playlists
-            # 移除(改为只在 #/browse 浏览页可见)。开关改名为"在浏览页显示",
-            # 关闭后 browse 入口 LX Music 下不再显示排行榜 / 广场歌单子菜单。
+        # Leaderboards and square playlists live in the browse view only, not in
+        # library playlists; these toggles show or hide those browse entries.
             ConfigEntry(
                 key=CONF_IMPORT_LEADERBOARDS,
                 type=ConfigEntryType.BOOLEAN,
@@ -376,6 +484,72 @@ class LxMusicProvider(MusicProvider):
                     "(每分类 top 5,共约 25~300 个)。关闭后该入口消失。"
                 ),
             ),
+        # Radio rotation interval. Read per use, so changes apply without a restart.
+            ConfigEntry(
+                key=CONF_RADIO_INTERVAL,
+                type=ConfigEntryType.INTEGER,
+                label="洛雪电台刷新间隔（分钟）",
+                default_value=int(
+                    self.get_setup_value(CONF_RADIO_INTERVAL)
+                    or RADIO_INTERVAL_DEFAULT
+                ),
+                range=(RADIO_INTERVAL_MIN, RADIO_INTERVAL_MAX),
+                required=False,
+                description=(
+                    "洛雪电台每隔多少分钟换一批歌。同一个间隔内每次打开都是"
+                    "同一批歌,跨间隔才换。默认 60 分钟(每小时一次),"
+                    f"可设 {RADIO_INTERVAL_MIN}~{RADIO_INTERVAL_MAX} 分钟。"
+                ),
+            ),
+        # Per-slot recommendation sources. Read per use, so changes apply at once.
+            ConfigEntry(
+                key=CONF_DAILY_SOURCE,
+                type=ConfigEntryType.STRING,
+                label="每日推荐音源",
+                default_value=str(
+                    self.get_setup_value(CONF_DAILY_SOURCE) or RECO_SOURCE_DEFAULT
+                ),
+                options=[
+                    ConfigValueOption(value=src, title=SOURCE_NAMES.get(src, src))
+                    for src in RECO_SOURCES
+                ],
+                required=False,
+                description=(
+                    "每日推荐从哪个平台的官方榜单混合取歌(飙升/新歌/原创/热歌等),"
+                    "每天换一批。默认酷我。切换后立即生效,无需重启。"
+                ),
+            ),
+            ConfigEntry(
+                key=CONF_NEWSONG_SOURCE,
+                type=ConfigEntryType.STRING,
+                label="推荐新曲音源",
+                default_value=str(
+                    self.get_setup_value(CONF_NEWSONG_SOURCE) or RECO_SOURCE_DEFAULT
+                ),
+                options=[
+                    ConfigValueOption(value=src, title=SOURCE_NAMES.get(src, src))
+                    for src in RECO_SOURCES
+                ],
+                required=False,
+                description=(
+                    "推荐新曲从哪个平台的官方新歌榜混合取歌(新歌/飙升/原创等),"
+                    "默认酷我。切换后立即生效,无需重启。"
+                ),
+            ),
+        # Two-way love-list sync toggle: off keeps playlist sync only.
+            ConfigEntry(
+                key=CONF_SYNC_LOVE_LIST,
+                type=ConfigEntryType.BOOLEAN,
+                label="同步洛雪红心收藏",
+                default_value=self._sync_love_list_enabled(),
+                required=False,
+                description=(
+                    "洛雪 App / lxserver 网页端的红心(收藏)与 Music Assistant "
+                    "曲库收藏双向同步:洛雪端加/取消红心会随库同步进入/移出 MA "
+                    "收藏(默认每 12 小时同步一次);在 MA 里点红心或取消收藏也会"
+                    "实时写回洛雪。关闭后红心不再同步,已在曲库里的条目保留。"
+                ),
+            ),
         )
 
     @property
@@ -384,7 +558,7 @@ class LxMusicProvider(MusicProvider):
         return True
 
     async def test_connection(self) -> bool:
-        """Test the connection to the LX Music server via login (/api/status 需认证会误报 401)."""
+        """Test the connection by logging in; /api/status requires auth and would 401."""
         try:
             session = self._session()
             async with session.post(
@@ -393,7 +567,7 @@ class LxMusicProvider(MusicProvider):
             ) as resp:
                 return resp.status == 200
         except Exception as err:  # noqa: BLE001
-            LOGGER.warning("LX Music 连接测试失败: %s", err)
+            LOGGER.warning("LX Music connection test failed: %s", err)
         return False
 
     # ------------------------------------------------------------------ #
@@ -446,7 +620,7 @@ class LxMusicProvider(MusicProvider):
 
     @staticmethod
     async def _handle_response(resp: aiohttp.ClientResponse) -> Any:
-        """读取响应；非 2xx 时把服务端返回的正文一并抛出，便于排查。"""
+        """Read a response, raising with the body included on a non-2xx status."""
         if resp.status >= 400:
             body = ""
             try:
@@ -454,16 +628,16 @@ class LxMusicProvider(MusicProvider):
             except Exception:  # noqa: BLE001
                 pass
             raise RuntimeError(
-                f"HTTP {resp.status} {resp.reason} 响应体: {body[:500]}"
+                f"HTTP {resp.status} {resp.reason} body: {body[:500]}"
             )
         return await resp.json()
 
     async def _login(self) -> None:
         """Authenticate and store the token."""
-        # 2026-09-04 诊断:实际发往 LX 服务端的字段到底是不是真的非空。
-        # 如果 username 是 '' 或者 password 是 '',那服务端一定返回 400。
+        # Log the credentials actually sent: an empty username or password here
+        # is what makes the server answer 400.
         LOGGER.warning(
-            "lxmusic: _login 发请求 | url=%s/api/user/login | username=%r | password_len=%d",
+            "lxmusic: login request | url=%s/api/user/login | username=%r | password_len=%d",
             self._server_url,
             self._username,
             len(self._password or ""),
@@ -476,13 +650,13 @@ class LxMusicProvider(MusicProvider):
                 use_auth=False,
             )
         except Exception as err:
-            LOGGER.exception("lxmusic: _login 失败: %s", err)
+            LOGGER.exception("lxmusic: login failed: %s", err)
             raise
         if isinstance(result, dict):
             self._token = result.get("token") or result.get("data", {}).get("token")
         if not self._token:
-            raise RuntimeError("LX Music 登录失败：未获取到 token")
-        LOGGER.info("lxmusic: 已登录 lxserver，当前用户=%s", self._username)
+            raise RuntimeError("LX Music login failed: no token returned")
+        LOGGER.info("lxmusic: logged in to lxserver as %s", self._username)
 
     # ------------------------------------------------------------------ #
     # Search & browse
@@ -503,17 +677,17 @@ class LxMusicProvider(MusicProvider):
                 },
             )
         except Exception as err:  # noqa: BLE001
-            LOGGER.debug("LX 搜索音源 %s 失败: %s", source, err)
+            LOGGER.debug("LX search source %s failed: %s", source, err)
             return []
         return self._normalize_list(result)
 
     @staticmethod
     def _normalize_list(result: Any) -> list[dict[str, Any]]:
-        """lxserver 返回结构多样，统一成歌曲/歌单列表。
+        """Normalize the many response shapes lxserver returns into a plain list.
 
-        兼容：裸数组、{list:[...]}、{songs:[...]}、{musics:[...]}、
-        {tags:[...]}、{boards:[...]}、{playlists:[...]}、
-        {data:{list:[...]}}、{data:{songs:[...]}}、{data:[...]} 等。
+        Handles bare lists plus wrappers such as {list: [...]}, {songs: [...]},
+        {musics: [...]}, {tags: [...]}, {boards: [...]}, {playlists: [...]} and
+        the same nested under {data: ...}.
         """
         if isinstance(result, list):
             return result
@@ -538,7 +712,8 @@ class LxMusicProvider(MusicProvider):
     ) -> SearchResults:
         """Search the LX Music server across configured sources.
 
-        lxserver 只提供按歌名搜索的接口，因此歌手/专辑结果由歌曲结果聚合得到。
+        lxserver only exposes a song-name search, so artist and album results
+        are aggregated from the tracks found.
         """
         results = SearchResults()
         keyword = search_query if isinstance(search_query, str) else search_query.search_term
@@ -557,7 +732,7 @@ class LxMusicProvider(MusicProvider):
         for source in self._search_sources:
             items = await self._search_source(source, keyword, page_size=per_source)
             for item in items:
-                # 歌曲
+                # tracks
                 if want_track:
                     song_id = self._item_song_id(item)
                     if song_id:
@@ -567,7 +742,7 @@ class LxMusicProvider(MusicProvider):
                             track = await self._parse_track(item, source)
                             if track:
                                 results.tracks.append(track)
-                # 歌手（singer 可能是字符串或数组）；尽量带上真实歌手 ID 供回查
+                # artists: singer may be a string or a list; keep the real id when present
                 if want_artist:
                     singer_names, real_artist_id = self._singer_info(item)
                     for artist_name in singer_names:
@@ -575,12 +750,12 @@ class LxMusicProvider(MusicProvider):
                         if aid in seen_artists:
                             continue
                         seen_artists.add(aid)
-                        # 优先使用本次搜索到的真实 ID，否则回退到已缓存的
+                        # prefer the id seen in this search, else the cached one
                         rid = real_artist_id or self._artist_cache.get(aid, {}).get(
                             "real_id"
                         )
                         results.artists.append(self._register_artist(source, artist_name, rid))
-                # 专辑（优先用真实 albumId，便于点击后拉取歌曲）
+                # albums: prefer the real album id so tracks can be fetched later
                 if want_album:
                     album_id = self._album_id(item)
                     album_name = item.get("albumName") or item.get("album") or "未知专辑"
@@ -592,7 +767,7 @@ class LxMusicProvider(MusicProvider):
                     if aid not in seen_albums:
                         seen_albums.add(aid)
                         results.albums.append(self._register_album(source, album_name, album_id))
-            # 各类型都达到上限则停止
+            # stop once every requested type hit the limit
             if (
                 (not want_track or len(results.tracks) >= limit)
                 and (not want_artist or len(results.artists) >= limit)
@@ -600,7 +775,7 @@ class LxMusicProvider(MusicProvider):
             ):
                 break
 
-        # 歌单搜索：先搜网络/广场歌单（songList/search），再按名称匹配用户自己的 lx 歌单
+        # Playlists: search square/discover lists first, then match the user's own lists by name
         if want_playlist:
             seen_playlists: set[str] = set()
             for pl in await self._search_song_lists(keyword, limit=limit):
@@ -611,7 +786,7 @@ class LxMusicProvider(MusicProvider):
             if data:
                 kw = keyword.lower()
                 for pid, pname, songs in self._iter_user_playlists(data):
-                    # 匹配歌单名，或歌单内任意歌曲名/歌手（lxserver 无广场歌单关键词 API）
+                    # match the playlist name, or any track name/artist inside it
                     hit = bool(kw) and kw in (pname or "").lower()
                     if not hit:
                         for s in songs:
@@ -646,10 +821,10 @@ class LxMusicProvider(MusicProvider):
     async def _search_song_lists(
         self, keyword: str, limit: int = 25
     ) -> list[Playlist]:
-        """搜索网络/广场歌单（lxserver /api/music/songList/search）。
+        """Search square/discover playlists via /api/music/songList/search.
 
-        遍历配置的音源，把命中的歌单转成 sl:<source>:<id> 的 Playlist，
-        并缓存歌单名/封面到 _square_meta，供打开歌单时回填。
+        Queries every configured source, converts hits into sl:<source>:<id>
+        playlists and caches name/cover in _square_meta for later lookups.
         """
         if not keyword:
             return []
@@ -668,7 +843,7 @@ class LxMusicProvider(MusicProvider):
                     },
                 )
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("songList/search 音源 %s 失败: %s", source, err)
+                LOGGER.debug("songList/search source %s failed: %s", source, err)
                 continue
             for sl in self._normalize_list(result):
                 sl_id = sl.get("id") or sl.get("listId") or sl.get("playId")
@@ -722,26 +897,32 @@ class LxMusicProvider(MusicProvider):
     async def browse(self, path: str | None = None) -> Sequence[BrowseFolder | ItemMapping | Any]:
         """Browse the LX Music provider.
 
-        2026-09-06 BUG #80 split: virtual playlists (leaderboards / square /
-        defaultList) moved out of ``#/library/playlists`` and live ONLY here.
+        Virtual playlists (leaderboards, square, defaults) are exposed here only,
+        not under the library playlists.
 
-        2026-09-06 BUG #81 fix: MA 2.x BrowseFolder 没有 ``items`` 字段
-        (``items`` 只在 ``RecommendationFolder`` 里),``browse()`` 必须返回扁平
-        ``Sequence[BrowseFolder | ItemMapping | MediaItem]`` —— 每项是同级子节点,
-        通过 ``BrowseFolder.item_id`` 作为子路径(provider 自动拼 ``path``),
-        MA 再用该 path 触发下一级 ``browse()``。
+        MA 2.x BrowseFolder has no ``items`` field, so browse() must return a
+        flat sequence of sibling nodes; MA re-enters browse() with each folder's
+        item_id as the next path.
         """
         return await self._browse_impl(path)
 
     async def _browse_impl(self, path: str | None = None) -> Sequence[BrowseFolder | ItemMapping | Any]:
-        """Browse 的实际实现 (详见 ``browse()`` docstring)."""
+        """The real browse implementation; see the browse() docstring."""
         _P = self.instance_id
         if not path or path == f"{_P}://":
-            # 顶层:返回所有顶级子 folder(BrowseFolder 列表,不含 items 字段)
+            # top level: one BrowseFolder per section
             children: list[BrowseFolder | ItemMapping] = []
-            # 5 个源"热门"——纯文件夹入口,点开走 source/{src} 子分支显示热门歌曲。
-            # 2026-09-06 用户决定:lxserver 端"热门"不是真歌单(只是关键词搜索的歌曲列表),
-            # 不包装成虚拟 Playlist,保持 BrowseFolder 最简形式。
+            # browse() is fully overridden, so the recommendations entry the base
+            # class would add automatically has to be added here as well.
+            children.append(
+                BrowseFolder(
+                    item_id="recommendations",
+                    provider=self.instance_id,
+                    name="推荐",
+                )
+            )
+            # Per-source "hot" entries. lxserver treats "hot" as a keyword search
+            # rather than a real playlist, so these stay plain folders.
             for source in self._search_sources:
                 children.append(
                     BrowseFolder(
@@ -750,10 +931,8 @@ class LxMusicProvider(MusicProvider):
                         name=f"{SOURCE_NAMES.get(source, source)} 热门",
                     )
                 )
-            # BUG #98 (2026-09-07): 「我的歌单」BrowseFolder 取消。
-            # 用户的 LX webplayer 歌单已经通过 get_library_playlists
-            # 走 MA library/playlists 标准 sync, browse 顶层再放一个入口
-            # 是冗余 + 多一次点击。 直接删, 不在 browse 里暴露。
+            # The user's own playlists reach MA through the library sync, so a
+            # separate browse entry would only duplicate them.
             children.append(
                 BrowseFolder(
                     item_id="playlists/recent",
@@ -779,6 +958,25 @@ class LxMusicProvider(MusicProvider):
                 )
             return children
 
+        # Recommendation browsing: same semantics as the base class, reimplemented
+        # because browse() is overridden.
+        if path == f"{_P}://recommendations":
+            rows = await self.get_recommendations()
+            return [
+                BrowseFolder(
+                    item_id=row.item_id,
+                    provider=self.instance_id,
+                    name=row.name,
+                    is_playable=row.is_playable,
+                    image=row.image,
+                    path=f"{path}/{row.item_id}",
+                )
+                for row in rows
+            ]
+        if path.startswith(f"{_P}://recommendations/"):
+            row_id = path.replace(f"{_P}://recommendations/", "", 1)
+            return list(await self.get_recommendation_items(row_id))
+
         if path.startswith(f"{_P}://source/"):
             source = path.replace(f"{_P}://source/", "")
             items = await self._search_source(source, "热门", page_size=20)
@@ -787,9 +985,8 @@ class LxMusicProvider(MusicProvider):
                 track = await self._parse_track(item, source)
                 if not track:
                     continue
-                # BUG #82 (2026-09-06): ItemMapping.image 补封面 —— _parse_track
-                # 已经把 pic 写到 track.metadata.images,这里把第一张 THUMB 转成
-                # ItemMapping.image,否则 UI 列表里歌曲没封面。
+                # carry the cover over as ItemMapping.image, otherwise the browse
+                # list shows tracks without artwork
                 thumb_image = None
                 if track.metadata and track.metadata.images:
                     for img in track.metadata.images:
@@ -807,9 +1004,8 @@ class LxMusicProvider(MusicProvider):
                 )
             return children
 
-        # BUG #98 (2026-09-07): 「playlists/user」子分支已废弃。
-        # 用户 LX webplayer 歌单走 library/playlists 标准 sync,
-        # 此处不再提供 browse 入口, 避免与 sync 重复展示。
+        # The playlists/user branch is gone: user playlists come from the library
+        # sync, and a browse entry here would show them twice.
 
         if path == f"{_P}://playlists/recent":
             children = []
@@ -831,14 +1027,11 @@ class LxMusicProvider(MusicProvider):
             return children
 
         if path == f"{_P}://playlists/board":
-            # BUG #94 (2026-09-07): 取消平台中间层
-            # v1.1.7 ~ v1.1.8 这里是 4 个 BrowseFolder(酷狗榜单/酷我榜单/
-            # 网易云榜单/QQ音乐榜单),用户反馈"进入排行榜文件夹读不出歌单",
-            # 且中间这层多一次点击没价值。改成直接平铺 161 个榜单,
-            # 用 [酷狗]/[酷我]/[网易]/[QQ] 前缀在 name 上区分同名榜单
-            # (4 个源都有"飙升榜"等)。
-            # 缓存守卫 _collect_virtual_meta -> _fill_leaderboards,
-            # handle_async_init 后台预 fill 后,首次点开也是毫秒级。
+            # Boards are listed flat instead of behind a per-platform folder: the
+            # extra level was one click for nothing, and boards that share a name
+            # across platforms are told apart by a [platform] prefix.
+            # _collect_virtual_meta is cache-guarded and prefetched at startup, so
+            # the first click is served from memory.
             children: list[ItemMapping] = []
             boards = await self._collect_virtual_meta(kinds=("board",))
             for b in boards:
@@ -865,26 +1058,24 @@ class LxMusicProvider(MusicProvider):
             return children
 
         if path == f"{_P}://playlists/square" or path == f"{_P}://playlists/square/all":
-            # 2026-09-06 BUG #88/89/91: LX /songList/list 不按 tag 过滤(curl 验证
-            # 华语/流行 两次请求前 5 个 id 完全一致),任何 hotTag/父→子 展开
-            # 切来切去都是同一份 source 全量。
-            # BUG #92 (2026-09-06): 用户反馈"多了一个二级目录",原 v1.1.5
-            # 顶层还塞了个"LX 广场歌单" BrowseFolder,点进去才看到 200 个
-            # ItemMapping,等于多一次点击。改成顶层直接展示 200 个歌单,
-            # 1 级就看到全部。`playlists/square/all` 兼容旧 URL。
+            # The server does not filter /songList/list by tag, so expanding
+            # parent tags into sub-tags only repeats the same full list.
+            # Square playlists are shown flat at this level; an extra folder in
+            # front of them was one click for nothing. The /all suffix is kept
+            # for paths stored before that change.
             children: list[ItemMapping] = []
             try:
                 items = await self._fetch_square_all_items()
                 children.extend(items)
                 LOGGER.debug(
-                    "lxmusic: 广场歌单 | top %d (扁平展示)",
+                    "lxmusic: square playlists | %d items (flat listing)",
                     len(children),
                 )
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("获取广场歌单失败: %s", err)
+                LOGGER.debug("failed to fetch square playlists: %s", err)
             return children
 
-        # 未知路径:返回空列表(避免 items 属性报错)
+        # Unknown path: return an empty list
         return []
     # ------------------------------------------------------------------ #
     # Media item getters
@@ -893,9 +1084,9 @@ class LxMusicProvider(MusicProvider):
         """Get a single track."""
         cached = getattr(self, "_track_cache", {}).get(prov_track_id)
         if cached is not None:
-            # BUG #103 (2026-09-07): _track_cache 可能在搜索/列表等热路径
-            # 由 _parse_track 写入,那时不注入歌词。补一次 _maybe_fetch_lyrics;
-            # 内部 _lyrics_cache 命中即 return,不会重复打 lxserver。
+            # The cache is filled by _parse_track on hot paths, which does not
+            # fetch lyrics; do it here. The lyric cache makes this a no-op when
+            # they were already fetched.
             await self._maybe_fetch_lyrics(cached)
             return cached
         source, song_id = self._split_id(prov_track_id)
@@ -904,19 +1095,40 @@ class LxMusicProvider(MusicProvider):
             if self._item_song_id(item) == song_id:
                 track = await self._parse_track(item, source)
                 if track:
-                    # BUG #100 (2026-09-07): 注入歌词到 track.metadata.lrc_lyrics,
-                    # 让 MA lyric controller 第一优先路径命中。
-                    # 仅在 get_track 入口注入 (不在 _parse_track),避免阻塞
-                    # 搜索/歌单列表等热路径。
+                    # Attach lyrics so the MA lyric controller hits its first
+                    # lookup path. Only done here, not in _parse_track, to keep
+                    # search and listing paths free of extra requests.
                     await self._maybe_fetch_lyrics(track, item)
                     return track
+        # A songmid is not a usable search keyword on most sources, so on a cold
+        # cache fall back to scanning the user's own lists (love list, favorites,
+        # custom playlists). Cached with a TTL, at most one request.
+        raw = getattr(self, "_raw_cache", {}).get(prov_track_id)
+        if isinstance(raw, dict):
+            track = await self._parse_track(raw, source)
+            if track:
+                await self._maybe_fetch_lyrics(track, raw)
+                return track
+        data = await self._get_user_lists()
+        if isinstance(data, dict):
+            for _pl_id, _name, songs in self._iter_user_playlists(data):
+                for item in songs:
+                    if (
+                        isinstance(item, dict)
+                        and str(item.get("source") or source) == source
+                        and self._item_song_id(item) == song_id
+                    ):
+                        track = await self._parse_track(item, source)
+                        if track:
+                            await self._maybe_fetch_lyrics(track, item)
+                            return track
         raise FileNotFoundError(f"Track {prov_track_id} not found")
 
     async def get_album(self, prov_album_id: str) -> Album:
-        """专辑元数据。
+        """Album metadata.
 
-        注意：当前 MA 版本的 Album 模型不含 tracks 字段，曲目需在
-        get_album_tracks() 中单独返回，这里只构建元数据。
+        The Album model in this MA version has no tracks field; tracks are
+        returned separately by get_album_tracks().
         """
         info = self._album_cache.get(prov_album_id)
         album_name = (
@@ -936,14 +1148,14 @@ class LxMusicProvider(MusicProvider):
         )
 
     async def get_album_tracks(self, prov_album_id: str) -> list[Track]:
-        """返回专辑曲目：优先真实 albumId，否则用缓存，最后按专辑名回搜。"""
+        """Album tracks: real albumId first, then cache, then a search by album name."""
         info = self._album_cache.get(prov_album_id)
         source = info["source"] if info else self._split_id(prov_album_id)[0]
         real_id = info.get("real_id") if info else None
         album_name = (
             info["name"] if info else (self._split_id(prov_album_id)[1] or "未知专辑")
         )
-        # 1) 优先用真实 albumId 拉取完整专辑
+        # 1) fetch the full album by real albumId
         if real_id:
             try:
                 items = await self._fetch_paged(
@@ -959,8 +1171,8 @@ class LxMusicProvider(MusicProvider):
                 if out:
                     return out
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("albumSongs 失败 %s: %s", prov_album_id, err)
-        # 2) 用搜索/歌手页已解析的同专辑曲目兜底（最可靠，不依赖 albumId）
+                LOGGER.debug("albumSongs failed %s: %s", prov_album_id, err)
+        # 2) fall back to tracks already parsed for this album, which needs no albumId
         cached = self._album_tracks.get(prov_album_id)
         if cached:
             seen_tracks: set[str] = set()
@@ -971,7 +1183,7 @@ class LxMusicProvider(MusicProvider):
                     out.append(track)
             if out:
                 return out
-        # 3) 兜底：按专辑名回搜并过滤同名专辑
+        # 3) last resort: search by album name and keep matching albums only
         out = []
         if album_name and album_name != "未知专辑":
             try:
@@ -986,11 +1198,11 @@ class LxMusicProvider(MusicProvider):
                     if len(out) >= 20:
                         break
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("专辑回搜失败 %s: %s", prov_album_id, err)
+                LOGGER.debug("album re-search failed %s: %s", prov_album_id, err)
         return out
 
     async def get_artist(self, prov_artist_id: str) -> Artist:
-        """Artists：优先从缓存取名称，否则回退到 ID 拆分。"""
+        """Artist metadata: cached name if known, else derived from the id."""
         info = self._artist_cache.get(prov_artist_id)
         if info:
             return self._make_artist(info["source"], info["name"], prov_artist_id)
@@ -1009,18 +1221,32 @@ class LxMusicProvider(MusicProvider):
         )
 
     async def get_playlist(self, prov_playlist_id: str) -> Playlist:
-        """歌单元数据：支持用户歌单 list:<id> 与广场歌单 sl:<source>:<id>。
+        """Playlist metadata for user lists (list:<id>) and square lists (sl:<source>:<id>).
 
-        注意：当前 MA 版本的 Playlist 模型不含 tracks 字段，曲目需在
-        get_playlist_tracks() 中单独返回，这里只构建元数据。
+        The Playlist model in this MA version has no tracks field; tracks are
+        returned separately by get_playlist_tracks().
 
-        2026-09-04 BUG #36 扩展: 同时支持虚拟歌单:
-        - list:board:<src>:<bangid>   → 排行榜
-        - list:songlist:<src>:<sl_id> → 广场精选
+        Virtual playlists are also supported:
+        - list:board:<src>:<bangid>    -> leaderboard
+        - list:songlist:<src>:<sl_id>  -> square pick
+        - list:fm:radio                -> the rotating radio playlist
         """
-        # 虚拟歌单(排行榜 / 广场精选): 复用 get_library_playlists yield 时缓存的元数据
+        # Radio: a dynamic playlist whose metadata comes from the current pool
+        if prov_playlist_id == RADIO_PLAYLIST_ITEM_ID:
+            return await self._build_radio_playlist()
+        # Virtual playlists (leaderboards / square picks): reuse the metadata cached
         if prov_playlist_id.startswith(("list:board:", "list:songlist:")):
             meta = self._virtual_meta.get(prov_playlist_id)
+            if not meta and prov_playlist_id.startswith("list:songlist:"):
+                # Without metadata the name falls back to the raw item id, which
+                # shows up in the UI as something like
+                # "list:songlist:kw:digest-8__3689581612". Fetch it on demand:
+                # songList/detail returns name/img/author in its info field.
+                parts = prov_playlist_id.split(":", 3)
+                meta = await self._songlist_meta(
+                    parts[2] if len(parts) > 2 else "",
+                    parts[3] if len(parts) > 3 else "",
+                )
             playlist = Playlist(
                 item_id=prov_playlist_id,
                 provider=self.instance_id,
@@ -1033,10 +1259,8 @@ class LxMusicProvider(MusicProvider):
                     )
                 },
             )
-            # BUG #95 (2026-09-07): 字段名错配
-            # _fill_leaderboards 写的是 ``pic``(排行榜自己的封面字段),
-            # 而 _fetch_square_* 写的是 ``img``(LX 广场歌单返回字段)。
-            # 原代码统一读 ``img`` 导致排行榜永远没封面。兼容两种 key。
+            # Leaderboards store their cover under "pic" and square playlists
+            # under "img", so accept both keys here.
             img = (meta or {}).get("pic") or (meta or {}).get("img")
             if img:
                 playlist.metadata.images = [
@@ -1068,7 +1292,7 @@ class LxMusicProvider(MusicProvider):
                     name = pl_name
                     songs = pl_songs
                     break
-        # 缓存原始歌曲列表，供 get_playlist_tracks 复用
+        # Cache the raw song list so get_playlist_tracks can reuse it
         self._playlist_cache[prov_playlist_id] = songs
         return Playlist(
             item_id=prov_playlist_id,
@@ -1084,7 +1308,7 @@ class LxMusicProvider(MusicProvider):
         )
 
     def _make_square_playlist(self, source: str, sl_id: str) -> Playlist:
-        """广场歌单元数据：用 _square_meta 缓存回填名字与封面。"""
+        """Build a square playlist, filling name and cover from _square_meta."""
         item_id = f"sl:{source}:{sl_id}"
         meta = self._square_meta.get(item_id, {})
         playlist = Playlist(
@@ -1113,26 +1337,34 @@ class LxMusicProvider(MusicProvider):
     async def get_playlist_tracks(
         self, prov_playlist_id: str, page: int = 0
     ) -> list[Track]:
-        """返回歌单内的曲目（当前 MA 协议：曲目与元数据分离，且按 page 分页）。
+        """Return playlist tracks, paginated as the MA protocol requires.
 
-        MA 的 playlists.tracks() 会以 page=0,1,2... 递增调用本方法，直到某页返回
-        空列表才停止。因此这里必须按 page 切片返回，否则会陷入无限循环、导致 UI
-        一直拿不到完整曲目列表（表现为歌单打开后没有歌曲）。
+        MA calls this with page=0,1,2,... until a page comes back empty, so the
+        result must be sliced by page or the loop never terminates and the UI
+        ends up with no tracks at all.
 
-        2026-09-04 扩展: 虚拟歌单 ID 派发:
-        - list:board:<src>:<bangid>     → 排行榜 (调 /api/music/leaderboard/list)
-        - list:songlist:<src>:<sl_id>   → 广场精选歌单 (调 /api/music/songList/detail)
-        - 其他 (list:__default__ / list:__love__ / list:<user_id>) → 用户自建歌单
+        Virtual playlist ids are dispatched here:
+        - list:board:<src>:<bangid>    -> leaderboard
+        - list:songlist:<src>:<sl_id>  -> square pick
+        - list:fm:radio                -> radio, page 0 only
+        - anything else                -> the user's own playlists
         """
         page_size = 100
         start = page * page_size
-        # 排行榜虚拟歌单
+        # The radio playlist is dynamic: MA only reads one batch from it, so
+        # content is returned on page 0 and later pages must be empty or the
+        # pagination loop would not stop.
+        if prov_playlist_id == RADIO_PLAYLIST_ITEM_ID:
+            if page > 0:
+                return []
+            return await self._get_radio_tracks()
+        # Leaderboard virtual playlist
         if prov_playlist_id.startswith("list:board:"):
             parts = prov_playlist_id.split(":", 3)
             source = parts[2] if len(parts) > 2 else ""
             bangid = parts[3] if len(parts) > 3 else ""
             return await self._get_leaderboard_tracks(source, bangid, page)
-        # 广场精选歌单虚拟 ID
+        # Square pick virtual playlist id
         if prov_playlist_id.startswith("list:songlist:"):
             parts = prov_playlist_id.split(":", 3)
             source = parts[2] if len(parts) > 2 else self._default_source
@@ -1149,7 +1381,7 @@ class LxMusicProvider(MusicProvider):
                     max_items=1000,
                 )
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("广场歌单详情失败 %s: %s", prov_playlist_id, err)
+                LOGGER.debug("square playlist detail failed %s: %s", prov_playlist_id, err)
                 return []
             out: list[Track] = []
             for item in items[start : start + page_size]:
@@ -1158,14 +1390,14 @@ class LxMusicProvider(MusicProvider):
                     out.append(track)
             return out
 
-        # 用户歌单：优先用缓存的歌曲列表
+        # User playlist: prefer the cached song list
         songs = self._playlist_cache.get(prov_playlist_id)
         if songs is None:
             await self.get_playlist(prov_playlist_id)
             songs = self._playlist_cache.get(prov_playlist_id, [])
-        # BUG #32 (2026-09-04) 修复: lxserver /api/user/list 返回的 MusicInfo 只有
-        # id/name/singer/source/interval/meta,没有 img/pic/image/cover 字段,
-        # 用户歌单歌曲在 MA 上显示无封面。第一页触发时,并发重搜补全。
+        # The user list endpoint returns no cover field, so tracks from user
+        # playlists would show without artwork; enrich the first page by
+        # re-searching those tracks concurrently.
         page_songs = songs[start : start + page_size]
         if page == 0 and page_songs:
             await self._enrich_playlist_pics(page_songs)
@@ -1177,44 +1409,910 @@ class LxMusicProvider(MusicProvider):
                 out.append(track)
         return out
 
+    # ------------------------------------------------------------------ #
+    # Recommendations and the radio playlist
+    #
+    # Everything comes from lxserver itself, with no external dependency:
+    #   daily picks    -> Subsonic getDailySongs / leaderboards
+    #   new songs      -> /api/music/leaderboard/list
+    #   playlists      -> /api/music/songList/list
+    #   radio          -> /api/music/leaderboard/boards, boards picked at random
+    # ------------------------------------------------------------------ #
+    async def _subsonic_get(
+        self,
+        endpoint: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 15.0,
+    ) -> dict[str, Any]:
+        """Call the Subsonic layer built into lxserver (``/rest/<endpoint>``).
+
+        Subsonic auth here is ``t = md5(password + salt)`` with ``s = salt``.
+        The salt is random per request so the plaintext password never reaches
+        a URL, and logs only ever show the token.
+
+        Note: on auth failure the server still answers HTTP 200 with
+        ``status == "failed"`` and ``error.code = 40``, so the status must be
+        checked explicitly. Otherwise failures look like empty data and the
+        recommendation slots stay blank without any error.
+        """
+        salt = secrets.token_hex(SUBSONIC_SALT_BYTES)
+        token = hashlib.md5(f"{self._password}{salt}".encode()).hexdigest()
+        query: dict[str, Any] = {
+            "u": self._username,
+            "t": token,
+            "s": salt,
+            "v": SUBSONIC_VERSION,
+            "c": SUBSONIC_CLIENT,
+            "f": "json",
+        }
+        query.update(params or {})
+        result = await self._request(
+            "GET",
+            f"{SUBSONIC_PATH_DEFAULT}/{endpoint}",
+            params=query,
+            use_auth=False,
+            timeout=timeout,
+        )
+        payload = result.get("subsonic-response") if isinstance(result, dict) else None
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"unexpected Subsonic {endpoint} response: {type(result).__name__}"
+            )
+        if payload.get("status") != "ok":
+            err = payload.get("error")
+            detail = err.get("message") if isinstance(err, dict) else err
+            raise RuntimeError(f"Subsonic {endpoint} failed: {detail or 'unknown'}")
+        return payload
+
+    @staticmethod
+    def _subsonic_songs(payload: dict[str, Any], key: str) -> list[dict[str, Any]]:
+        """Extract the song array from a Subsonic response.
+
+        The wrapper key differs per endpoint: getDailySongs uses
+        recommendedSongs, getSongsByGenre uses songsByGenre, getAlbum uses
+        album. A single object is also valid per the Subsonic spec, so
+        normalize everything to a list.
+        """
+        node = payload.get(key)
+        if not isinstance(node, dict):
+            return []
+        songs = node.get("song")
+        if isinstance(songs, dict):
+            songs = [songs]
+        if not isinstance(songs, list):
+            return []
+        return [s for s in songs if isinstance(s, dict)]
+
+    @staticmethod
+    def _subsonic_song_to_lx(song: dict[str, Any]) -> dict[str, Any] | None:
+        """Convert a Subsonic Song into an lxserver item for _parse_track.
+
+        Subsonic ids look like ``tx_004CP8rh41xe1l``: the prefix is the source
+        and the remainder is the platform songmid, so the existing
+        get_stream_details path for official sources still works.
+
+        albumId is stripped the same way: Subsonic writes ``alb_tx_<mid>``
+        while the album endpoints only accept the bare mid.
+        """
+        raw_id = str(song.get("id") or "")
+        source, _, songmid = raw_id.partition("_")
+        if not songmid or source not in SOURCE_NAMES:
+            return None
+        name = str(song.get("name") or song.get("title") or "").strip()
+        if not name:
+            return None
+        item: dict[str, Any] = {
+            "source": source,
+            "songmid": songmid,
+            "name": name,
+            "singer": song.get("artist") or "",
+            "albumName": song.get("album") or "",
+            "interval": song.get("duration") or 0,
+        }
+        album_id = str(song.get("albumId") or "")
+        prefix = f"alb_{source}_"
+        if album_id.startswith(prefix):
+            item["albumId"] = album_id[len(prefix):]
+        elif album_id and not album_id.startswith("alb_"):
+            item["albumId"] = album_id
+        cover = song.get("coverArt")
+        # In responses such as getAlbumList2 coverArt is an internal id rather
+        # than a URL, and only http(s) links can be handed to MA as artwork.
+        if isinstance(cover, str) and cover.startswith(("http://", "https://")):
+            item["img"] = cover
+        return item
+
+    async def _reco_cache_get(self, key: str) -> Any:
+        """Read the recommendation cache; cache errors count as a miss."""
+        try:
+            return await self.mass.cache.get(
+                key=f"{_RECO_CACHE_VERSION}:{key}",
+                provider=self.instance_id,
+                category=CACHE_CATEGORY_RECOMMENDATIONS,
+                default=None,
+            )
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: recommendation cache read failed %s: %s", key, err)
+            return None
+
+    async def _reco_cache_set(self, key: str, data: Any, ttl: int) -> None:
+        try:
+            await self.mass.cache.set(
+                key=f"{_RECO_CACHE_VERSION}:{key}",
+                data=data,
+                expiration=ttl,
+                provider=self.instance_id,
+                category=CACHE_CATEGORY_RECOMMENDATIONS,
+            )
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: recommendation cache write failed %s: %s", key, err)
+
+    async def _reco_fetch(
+        self, key: str, ttl: int, loader: Any
+    ) -> list[dict[str, Any]]:
+        """Cache-first fetch: return the cache, else run the loader and store it.
+
+        The loader must return plain JSON-serializable dicts, so the cache holds
+        raw items rather than Track objects and stays valid across MA upgrades
+        or parser changes.
+        """
+        cached = await self._reco_cache_get(key)
+        if isinstance(cached, list) and cached:
+            rows = [x for x in cached if isinstance(x, dict)]
+            if rows:
+                return rows
+        items = await loader()
+        if items:
+            await self._reco_cache_set(key, items, ttl)
+        return items
+
+    async def get_recommendations(self) -> list[RecommendationFolder]:
+        """Return the recommendation slots.
+
+        MA applies a 5 second timeout to this call, so no network request is
+        made here at all: only static descriptions are returned. The actual
+        fetching happens in get_recommendation_items, which has a 30 second
+        budget.
+        """
+        return [
+            RecommendationFolder(
+                item_id=RECO_RADIO,
+                provider=self.instance_id,
+                name=RADIO_NAME,
+                icon="mdi:radio",
+                subtitle=f"随机抽取多个排行榜,每 {self._radio_interval_minutes()} 分钟换一批",
+            ),
+            RecommendationFolder(
+                item_id=RECO_DAILY,
+                provider=self.instance_id,
+                name="每日推荐",
+                icon="mdi:star",
+                subtitle=(
+                    f"{SOURCE_NAMES.get(self._daily_source(), '')}榜单混合,"
+                    "每天换一批"
+                ),
+            ),
+            RecommendationFolder(
+                item_id=RECO_NEW,
+                provider=self.instance_id,
+                name="推荐新曲",
+                icon="mdi:music-note",
+                subtitle=(
+                    f"{SOURCE_NAMES.get(self._newsong_source(), '')}新歌榜混合"
+                ),
+            ),
+            RecommendationFolder(
+                item_id=RECO_PLAYLISTS,
+                provider=self.instance_id,
+                name="推荐歌单",
+                icon="mdi:playlist-music",
+                subtitle="lxserver 广场精选歌单",
+            ),
+        ]
+
+    async def get_recommendation_items(self, item_id: str) -> UniqueList[Any]:
+        """Fetch the content of one recommendation slot, making requests here.
+
+        MA caps this at 30 seconds and degrades errors to an empty list, but
+        catching here as well keeps the real cause in the logs instead of a
+        single generic failure message.
+        """
+        items: UniqueList[Any] = UniqueList()
+        rows: list[dict[str, Any]] = []
+        try:
+            if item_id == RECO_RADIO:
+                playlist = await self._build_radio_playlist()
+                if playlist:
+                    items.append(playlist)
+                return items
+            if item_id == RECO_DAILY:
+                rows = await self._reco_daily_rows()
+            elif item_id == RECO_NEW:
+                rows = await self._reco_new_rows()
+            elif item_id == RECO_PLAYLISTS:
+                rows = await self._reco_playlist_rows()
+            else:
+                return items
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: recommendation slot %s fetch failed: %s", item_id, err)
+            return items
+
+        if item_id == RECO_PLAYLISTS:
+            for row in rows:
+                items.append(
+                    self._make_virtual_playlist(
+                        f"list:songlist:{row.get('source')}:{row.get('id')}",
+                        str(row.get("name") or "歌单"),
+                        row.get("img"),
+                        subtitle=(
+                            f"by {row['author']}" if row.get("author") else None
+                        ),
+                    )
+                )
+            return items
+
+        for row in rows:
+            source = str(row.get("source") or self._default_source)
+            try:
+                track = await self._parse_track(row, source)
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("lxmusic: recommendation slot %s track parse failed: %s", item_id, err)
+                continue
+            if track:
+                items.append(track)
+        return items
+
+    def _reco_source(self, key: str, label: str) -> str:
+        """Which platform's boards feed the daily / new-song slots.
+
+        Read from the provider config, falling back to the default on an
+        unknown value. get_setup_value checks setup_data and then the live
+        config, so changes apply without restarting MA.
+        """
+        raw = self.get_setup_value(key, RECO_SOURCE_DEFAULT)
+        src = str(raw or "").strip().lower()
+        if src not in RECO_SOURCES:
+            if src:
+                LOGGER.debug(
+                    "lxmusic: %s source %r is invalid, using %s", label, raw, RECO_SOURCE_DEFAULT
+                )
+            return RECO_SOURCE_DEFAULT
+        return src
+
+    def _daily_source(self) -> str:
+        """Daily source, see _reco_source."""
+        return self._reco_source(CONF_DAILY_SOURCE, "daily recommendations")
+
+    def _newsong_source(self) -> str:
+        """New-song source, see _reco_source."""
+        return self._reco_source(CONF_NEWSONG_SOURCE, "new song recommendations")
+
+    async def _reco_daily_rows(self) -> list[dict[str, Any]]:
+        """Daily picks: mix 4-5 official boards of one platform, shuffle by date.
+
+        The server's getDailySongs is assembled from a handful of recommended
+        albums, so its tracks share very few covers and the UI shows the same
+        artwork over and over. Mixing several boards instead gives close to one
+        distinct cover per row.
+
+        Board names differ per platform and are listed in
+        DAILY_BOARDS_BY_SOURCE. A board that fails is skipped; when the whole
+        platform comes back empty the fallback keywords are tried, then the
+        server-side getDailySongs. The shuffle seed is the calendar day, so the
+        list is stable within a day and rotates daily.
+        """
+        source = self._daily_source()
+        boards = DAILY_BOARDS_BY_SOURCE.get(source, DAILY_BOARDS_BY_SOURCE[RECO_SOURCE_DEFAULT])
+
+        async def _load() -> list[dict[str, Any]]:
+            pool: list[dict[str, Any]] = []
+            for name in boards:
+                try:
+                    pool.extend(await self._board_rows_by_name(name, source=source))
+                except Exception as err:  # noqa: BLE001
+                    LOGGER.debug("lxmusic: daily board %s/%s failed: %s", source, name, err)
+            # nothing from the configured boards: retry once with fallback names
+            if not pool:
+                for keyword in DAILY_FALLBACK_KEYWORDS:
+                    try:
+                        pool = await self._board_rows_by_name(keyword, source=source)
+                    except Exception as err:  # noqa: BLE001
+                        LOGGER.debug(
+                            "lxmusic: daily fallback board %s/%s failed: %s", source, keyword, err
+                        )
+                        continue
+                    if pool:
+                        break
+            # still empty: hot boards from the other platforms
+            if not pool:
+                for src in NEWSONG_FALLBACK_SOURCES:
+                    if src == source:
+                        continue
+                    try:
+                        pool = await self._board_rows_by_name("热歌", source=src)
+                    except Exception as err:  # noqa: BLE001
+                        LOGGER.debug(
+                            "lxmusic: daily hot-board fallback %s failed: %s", src, err
+                        )
+                        continue
+                    if pool:
+                        break
+            # last resort: the server-side getDailySongs
+            if not pool:
+                pool = await self._reco_daily_rows_subsonic()
+
+            # dedupe across boards, since one track often appears on several
+            seen: set[str] = set()
+            unique: list[dict[str, Any]] = []
+            for row in pool:
+                key = self._row_song_key(row)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                unique.append(row)
+            # cap per album: covers are album art
+            unique = self._limit_by_album(unique, DAILY_MAX_PER_ALBUM)
+            # shuffle by calendar day: stable today, different tomorrow
+            rng = random.Random(int(time.time()) // 86400)
+            rng.shuffle(unique)
+            return unique[:DAILY_TARGET]
+
+        # Key the cache by platform so switching does not serve the old platform
+        return await self._reco_fetch(f"{RECO_DAILY}:{source}", _RECO_TTL_DAILY, _load)
+
+    async def _reco_daily_rows_subsonic(self) -> list[dict[str, Any]]:
+        """Fallback: the server-side Subsonic getDailySongs."""
+        try:
+            payload = await self._subsonic_get("getDailySongs", {"size": 100})
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: getDailySongs failed: %s", err)
+            return []
+        return [
+            lx
+            for lx in (
+                self._subsonic_song_to_lx(s)
+                for s in self._subsonic_songs(payload, "recommendedSongs")
+            )
+            if lx
+        ]
+
+    @staticmethod
+    def _row_song_key(row: dict[str, Any]) -> str:
+        """Dedup key for a song: platform plus song id."""
+        return f"{row.get('source')}:{row.get('songmid') or row.get('songId') or row.get('id')}"
+
+    @staticmethod
+    def _limit_by_album(
+        rows: list[dict[str, Any]], max_per_album: int
+    ) -> list[dict[str, Any]]:
+        """Cap tracks per album, preserving order.
+
+        Covers are album art, so same-album rows look duplicated. Rows without
+        an album id are not counted and are always kept.
+        """
+        out: list[dict[str, Any]] = []
+        counts: dict[str, int] = {}
+        for row in rows:
+            album = str(row.get("albumId") or "")
+            if album:
+                n = counts.get(album, 0)
+                if n >= max_per_album:
+                    continue
+                counts[album] = n + 1
+            out.append(row)
+        return out
+
+    async def _reco_new_rows(self) -> list[dict[str, Any]]:
+        """New-song picks: mix the platform's "new" boards, dedupe and cap per album.
+
+        This used to take the first non-empty new-song board from a fixed source
+        list, i.e. a single board, which yields far fewer distinct covers than
+        mixing several new-oriented boards (new / rising / original) within one
+        platform. Hot and classic charts are deliberately excluded.
+
+        The shuffle seed is an hourly bucket, so the list is stable for an hour
+        and then rotates, matching the cache TTL. A board that fails is skipped;
+        if the platform comes back empty the fallback keywords are tried, then
+        other platforms' new-song boards, then the Subsonic newest albums.
+        """
+        source = self._newsong_source()
+        boards = NEWSONG_BOARDS_BY_SOURCE.get(
+            source, NEWSONG_BOARDS_BY_SOURCE[RECO_SOURCE_DEFAULT]
+        )
+
+        async def _load() -> list[dict[str, Any]]:
+            pool: list[dict[str, Any]] = []
+            for name in boards:
+                try:
+                    pool.extend(await self._board_rows_by_name(name, source=source))
+                except Exception as err:  # noqa: BLE001
+                    LOGGER.debug("lxmusic: new-song board %s/%s failed: %s", source, name, err)
+            # nothing from the configured boards: retry once with fallback names
+            if not pool:
+                for keyword in NEWSONG_FALLBACK_KEYWORDS:
+                    try:
+                        pool = await self._board_rows_by_name(keyword, source=source)
+                    except Exception as err:  # noqa: BLE001
+                        LOGGER.debug(
+                            "lxmusic: new-song fallback board %s/%s failed: %s", source, keyword, err
+                        )
+                        continue
+                    if pool:
+                        break
+            # still empty: new-song boards from the other platforms
+            if not pool:
+                for src in NEWSONG_FALLBACK_SOURCES:
+                    if src == source:
+                        continue
+                    try:
+                        pool = await self._board_rows_by_name("新歌", source=src)
+                    except Exception as err:  # noqa: BLE001
+                        LOGGER.debug("lxmusic: new-song fallback %s failed: %s", src, err)
+                        continue
+                    if pool:
+                        break
+            # last resort: tracks from the newest Subsonic albums
+            if not pool:
+                pool = await self._recent_album_rows()
+
+            # dedupe across boards, since one track is often on several charts
+            seen: set[str] = set()
+            unique: list[dict[str, Any]] = []
+            for row in pool:
+                key = self._row_song_key(row)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                unique.append(row)
+            # cap per album: covers are album art
+            unique = self._limit_by_album(unique, NEWSONG_MAX_PER_ALBUM)
+            rng = random.Random(int(time.time()) // 3600)
+            rng.shuffle(unique)
+            return unique[:NEWSONG_TARGET]
+
+        # Key the cache by platform so switching does not serve the old platform
+        return await self._reco_fetch(f"{RECO_NEW}:{source}", _RECO_TTL_NEWSONG, _load)
+
+    async def _songlist_meta(self, source: str, sl_id: str) -> dict[str, Any]:
+        """Fetch square playlist metadata (name/img/author/desc) with a persistent cache.
+
+        _virtual_meta is in-memory, so after a restart, or when recommendation
+        rows come from the cache, get_playlist would display the raw item id as
+        the name. songList/detail carries the full playlist info, so fetch it
+        once and keep it in the MA cache for an hour; the result also refills
+        _virtual_meta.
+
+        Note: this endpoint ignores page/limit and returns the whole track list,
+        which is discarded here since only the info field is wanted.
+        """
+        if not source or not sl_id:
+            return {}
+        item_id = f"list:songlist:{source}:{sl_id}"
+        cached = self._virtual_meta.get(item_id)
+        if cached and cached.get("name"):
+            return cached
+        cache_key = f"slmeta_{source}_{sl_id}"
+        stored = await self._reco_cache_get(cache_key)
+        if isinstance(stored, dict) and stored.get("name"):
+            self._virtual_meta[item_id] = stored
+            return stored
+        try:
+            data = await self._request(
+                "GET",
+                "/api/music/songList/detail",
+                params={"source": source, "id": sl_id, "page": 1, "limit": 1},
+            )
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: square playlist metadata failed %s: %s", item_id, err)
+            return {}
+        info = data.get("info") if isinstance(data, dict) else None
+        if not isinstance(info, dict) or not info.get("name"):
+            return {}
+        meta = {
+            "name": str(info.get("name") or "").strip(),
+            "source": source,
+            "sl_id": sl_id,
+            "img": str(info.get("img") or "").strip(),
+            "author": str(info.get("author") or "").strip(),
+            "desc": str(info.get("desc") or "").strip(),
+            "kind": "songlist",
+        }
+        self._virtual_meta[item_id] = meta
+        await self._reco_cache_set(cache_key, meta, _RECO_TTL_PLAYLISTS)
+        return meta
+
+    async def _reco_playlist_rows(self) -> list[dict[str, Any]]:
+        """Recommended playlists: square lists from all platforms, reusing the sl: virtual playlists."""
+
+        async def _load() -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for src in ("tx", "wy", "kw", "kg", "mg"):
+                try:
+                    data = await self._request(
+                        "GET",
+                        "/api/music/songList/list",
+                        params={"source": src, "page": 1},
+                    )
+                except Exception as err:  # noqa: BLE001
+                    LOGGER.debug("lxmusic: square playlists %s failed: %s", src, err)
+                    continue
+                raw = data.get("list") if isinstance(data, dict) else None
+                if not isinstance(raw, list):
+                    continue
+                for sl in raw:
+                    if not isinstance(sl, dict):
+                        continue
+                    sl_id = str(sl.get("id") or "").strip()
+                    if not sl_id:
+                        continue
+                    item = {
+                        "source": src,
+                        "id": sl_id,
+                        "name": (sl.get("name") or "未命名歌单").strip(),
+                        "author": (sl.get("author") or "").strip(),
+                        "img": (sl.get("img") or "").strip(),
+                    }
+                    rows.append(item)
+                    # Register the virtual playlist metadata so opening it hits
+                    # the cache instead of calling the server again.
+                    self._virtual_meta.setdefault(
+                        f"list:songlist:{src}:{sl_id}",
+                        {
+                            "name": item["name"],
+                            "source": src,
+                            "sl_id": sl_id,
+                            "img": item["img"],
+                            "author": item["author"],
+                            "kind": "songlist",
+                        },
+                    )
+            # sources are fetched in order, so shuffle to avoid one platform first
+            random.shuffle(rows)
+            return rows[:60]
+
+        return await self._reco_fetch(RECO_PLAYLISTS, _RECO_TTL_PLAYLISTS, _load)
+
+    def _radio_interval_minutes(self) -> int:
+        """Radio rotation interval in minutes, from the provider config.
+
+        Out-of-range values are clamped. The config entry is an INTEGER but may
+        arrive as a string, so convert it here.
+        """
+        raw = self.get_setup_value(
+            CONF_RADIO_INTERVAL, RADIO_INTERVAL_DEFAULT
+        )
+        try:
+            minutes = int(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            minutes = RADIO_INTERVAL_DEFAULT
+        return max(RADIO_INTERVAL_MIN, min(RADIO_INTERVAL_MAX, minutes or RADIO_INTERVAL_DEFAULT))
+
+    def _radio_interval_seconds(self) -> int:
+        """Rotation interval in seconds, floored at 60 to avoid dividing by zero."""
+        return max(60, self._radio_interval_minutes() * 60)
+
+    def _radio_bucket_no(self) -> int:
+        """Current time bucket: content is identical within a bucket and rotates across buckets."""
+        return int(time.time()) // self._radio_interval_seconds()
+
+    async def _reco_radio_pool(self) -> list[dict[str, Any]]:
+        """Radio candidate pool: real leaderboards picked per time bucket, plus daily picks.
+
+        The seed is the time bucket rather than an open counter, so within one
+        interval every open shows the same boards, tracks and order, and only
+        the next bucket changes them. The whole pool is cached under the bucket
+        with a TTL equal to the interval, so it expires exactly when a new
+        bucket starts.
+        """
+        bucket = self._radio_bucket_no()
+        ttl = self._radio_interval_seconds()
+
+        async def _load() -> list[dict[str, Any]]:
+            boards = await self._reco_boards()
+            pool: list[dict[str, Any]] = []
+            if boards:
+                # seed = bucket number: the sample is fixed within one interval
+                picks = random.Random(bucket).sample(
+                    boards, min(RADIO_BOARD_PICKS, len(boards))
+                )
+                for src, bangid, _name in picks:
+                    pool.extend(await self._reco_board_songs(src, bangid))
+            # mix in the daily picks so the radio is not purely random charts
+            try:
+                pool.extend((await self._reco_daily_rows())[:30])
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("lxmusic: radio daily-pick mix-in failed: %s", err)
+            return pool
+
+        return await self._reco_fetch(f"radio_pool_{bucket}", ttl, _load)
+
+    async def _reco_boards(self) -> list[tuple[str, str, str]]:
+        """All (source, bangid, board name) triples across platforms, cached for an hour."""
+
+        async def _load() -> list[tuple[str, str, str]]:
+            out: list[tuple[str, str, str]] = []
+            for src in NEWSONG_FALLBACK_SOURCES:
+                try:
+                    data = await self._request(
+                        "GET", "/api/music/leaderboard/boards", params={"source": src}
+                    )
+                except Exception as err:  # noqa: BLE001
+                    LOGGER.debug("lxmusic: radio board list %s failed: %s", src, err)
+                    continue
+                rows = data.get("list") if isinstance(data, dict) else None
+                if not isinstance(rows, list):
+                    continue
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    bangid = str(row.get("bangid") or "").strip()
+                    if not bangid:
+                        continue
+                    out.append((src, bangid, str(row.get("name") or bangid)))
+            return out
+
+        return await self._reco_fetch("radio_boards", _RECO_TTL_PLAYLISTS, _load)
+
+    async def _reco_board_songs(self, source: str, bangid: str) -> list[dict[str, Any]]:
+        """Candidate songs from one board, cached per board, first N only."""
+
+        async def _load() -> list[dict[str, Any]]:
+            rows = await self._board_rows(source, bangid)
+            rows = rows[:RADIO_SONGS_PER_BOARD]
+            # Board rows carry their own source, but override it explicitly:
+            # playback must use the requested platform, otherwise _parse_track
+            # may pick up an otherSource and fail to play.
+            for row in rows:
+                if isinstance(row, dict):
+                    row["source"] = source
+            return rows
+
+        return await self._reco_fetch(
+            f"radio_board_{source}_{bangid}", _RECO_TTL_RADIO, _load
+        )
+
+    async def _build_radio_playlist(self) -> Playlist:
+        """Descriptor for the dynamic radio playlist (is_dynamic=True)."""
+        image: str | None = None
+        try:
+            for row in await self._reco_radio_pool():
+                img = row.get("img")
+                if isinstance(img, str) and img:
+                    image = img
+                    break
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: radio cover lookup failed: %s", err)
+        return self._make_virtual_playlist(
+            RADIO_PLAYLIST_ITEM_ID,
+            RADIO_NAME,
+            image,
+            is_dynamic=True,
+            subtitle=f"随机抽取多个排行榜,每 {self._radio_interval_minutes()} 分钟换一批",
+        )
+
+    async def _get_radio_tracks(self) -> list[Track]:
+        """One batch of radio tracks: shuffle the pool, drop recent plays, parse.
+
+        The shuffle seed is the time bucket, so within one interval every open
+        yields the same tracks in the same order. MA's dynamic queue filters
+        duplicates itself; calling filter_tracks here only skips tracks it would
+        discard anyway.
+        """
+        try:
+            pool = await self._reco_radio_pool()
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: radio candidate pool failed: %s", err)
+            return []
+        if not pool:
+            return []
+        bucket = self._radio_bucket_no()
+        if bucket != self._radio_bucket:
+            self._radio_bucket = bucket
+            LOGGER.debug("lxmusic: radio moved to time bucket %d", bucket)
+        rng = random.Random(bucket)
+        candidates = list(pool)
+        rng.shuffle(candidates)
+        # dedupe by songmid: boards and daily picks overlap
+        seen: set[str] = set()
+        unique: list[dict[str, Any]] = []
+        for row in candidates:
+            key = f"{row.get('source')}:{row.get('songmid')}"
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(row)
+        tracks: list[Track] = []
+        for row in unique:
+            source = str(row.get("source") or self._default_source)
+            try:
+                track = await self._parse_track(row, source)
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("lxmusic: radio track parse failed: %s", err)
+                continue
+            if track:
+                tracks.append(track)
+        if _ma_filter_tracks is not None:
+            try:
+                filtered = _ma_filter_tracks(tracks)
+                if filtered:
+                    tracks = filtered
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("lxmusic: radio filter_tracks ignored: %s", err)
+        return tracks
+
+    def _make_virtual_playlist(
+        self,
+        item_id: str,
+        name: str,
+        image: str | None = None,
+        *,
+        is_dynamic: bool = False,
+        subtitle: str | None = None,
+    ) -> Playlist:
+        """Build a virtual or dynamic playlist object, shared by radio and picks."""
+        playlist = Playlist(
+            item_id=item_id,
+            provider=self.instance_id,
+            name=name,
+            provider_mappings={
+                ProviderMapping(
+                    item_id=item_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
+            is_dynamic=is_dynamic,
+        )
+        if subtitle:
+            playlist.metadata.description = subtitle
+        if image:
+            playlist.metadata.images = [
+                MediaItemImage(
+                    type=ImageType.THUMB,
+                    path=image,
+                    provider=self.instance_id,
+                    remotely_accessible=True,
+                )
+            ]
+        return playlist
+
+    async def _board_rows_by_name(
+        self, keyword: str, source: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Fetch leaderboard songs by board name, returning raw lxserver items.
+
+        Board ids are handed out by the server and differ per platform, so the
+        board is looked up by keyword first. Results are cached in memory, one
+        lookup per process.
+        """
+        sources = [source] if source else list(NEWSONG_FALLBACK_SOURCES)
+        for src in sources:
+            bangid = await self._resolve_board_id(src, keyword)
+            if not bangid:
+                continue
+            rows = await self._board_rows(src, bangid)
+            if rows:
+                return rows
+        return []
+
+    async def _resolve_board_id(self, source: str, keyword: str) -> str | None:
+        """Fuzzy-match a board name to its bangid on one platform."""
+        cache: dict[str, str | None] = self._board_id_cache
+        key = f"{source}:{keyword}"
+        if key in cache:
+            return cache[key]
+        bangid: str | None = None
+        try:
+            data = await self._request(
+                "GET", "/api/music/leaderboard/boards", params={"source": source}
+            )
+            # Note: this endpoint wraps its result in "list", not "boards".
+            rows = data.get("list") if isinstance(data, dict) else None
+            if isinstance(rows, list):
+                best: tuple[int, str] | None = None
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    name = str(row.get("name") or "")
+                    bid = str(row.get("bangid") or "").strip()
+                    if not bid or keyword not in name:
+                        continue
+                    # an exact name match is the intended board, take it at once
+                    # (daily picks address boards by full name)
+                    if name.strip() == keyword.strip():
+                        best = (0, bid)
+                        break
+                    # shorter names are closer to the flagship board of that kind
+                    score = len(name)
+                    if best is None or score < best[0]:
+                        best = (score, bid)
+                if best:
+                    bangid = best[1]
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: board lookup failed %s/%s: %s", source, keyword, err)
+        cache[key] = bangid
+        return bangid
+
+    async def _board_rows(self, source: str, bangid: str) -> list[dict[str, Any]]:
+        """Fetch the first page of one board as raw lxserver items."""
+        try:
+            data = await self._request(
+                "GET",
+                "/api/music/leaderboard/list",
+                params={"source": source, "bangid": bangid, "page": 1},
+            )
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: board %s/%s fetch failed: %s", source, bangid, err)
+            return []
+        rows = data.get("list") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            return []
+        return [r for r in rows if isinstance(r, dict)][:100]
+
+    async def _recent_album_rows(self) -> list[dict[str, Any]]:
+        """Fallback: newest Subsonic albums and their tracks, used only when new-song boards fail."""
+        rows: list[dict[str, Any]] = []
+        albums: Any = []
+        try:
+            payload = await self._subsonic_get(
+                "getAlbumList2", {"type": "recent", "size": 6}
+            )
+            node = payload.get("albumList2")
+            albums = node.get("album") if isinstance(node, dict) else []
+            if isinstance(albums, dict):
+                albums = [albums]
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: getAlbumList2 failed: %s", err)
+            return rows
+        for album in (albums if isinstance(albums, list) else [])[:6]:
+            if not isinstance(album, dict):
+                continue
+            album_id = str(album.get("id") or "")
+            if not album_id:
+                continue
+            try:
+                album_payload = await self._subsonic_get("getAlbum", {"id": album_id})
+            except Exception:  # noqa: BLE001
+                continue
+            for song in self._subsonic_songs(album_payload, "album"):
+                lx = self._subsonic_song_to_lx(song)
+                if lx:
+                    rows.append(lx)
+            if len(rows) >= 100:
+                break
+        return rows[:100]
     async def get_stream_details(
         self, item_id: str, media_type: MediaType = MediaType.TRACK
     ) -> StreamDetails | None:
         """Get stream details (playback URL) for a track.
 
-        /api/music/url 需要一个 songInfo 对象（至少含 source + songmid），
-        quality 取值为 flac/320k/128k。若有缓存的原始 item 则整体传入，命中率更高。
+        /api/music/url needs a songInfo object with at least source and
+        songmid, and quality is one of flac/320k/128k. A cached raw item is
+        passed whole when available, which matches more often.
 
-        BUG #33 (2026-09-04) 修复: lxserver 服务端 /api/music/url 只做同源
-        多 API fallback（如 wy 平台下切 meting/ikun），不会跨平台搜索歌曲。
-        当用户歌单里的歌来自 wy 平台，但 wy 自定义源（如 metingapi 网关）整体
-        失效时，无法 fallback 到 kw/kg/tx/mg。
+        The server only falls back between APIs within one platform, it does
+        not search other platforms for the song. Cross-platform re-search by
+        name is deliberately not done here: same-name hits are often covers,
+        remixes or other versions, which plays the wrong recording.
 
-        BUG #35 (2026-09-04) 修复: 之前客户端自己做跨平台重搜 fallback
-        (用 name+singer 在 kw/kg/tx/mg 上搜同名 songmid),结果搜索匹配不可靠:
-        kw/kg/tx/mg 上同名歌曲可能是翻唱/remix/不同版本,导致 MA 播放"错曲"。
-        已知跨平台 fallback 错曲问题,这里彻底禁用。
-
-        客户端这里只做:
-        1) 同源 (source) 内多 quality 循环,让 lxserver 自己按自定义源
-           (meting/ikun/...) 多 API fallback
-        2) URL 健康检查: 拿到 URL 后调 _check_url_playable 做一次 content-type
-           检查,过滤掉网关挂了但仍返回 200 的"假 URL"
-        3) 如果原平台所有 quality 都拿不到健康 URL,直接放弃——用户需要在
-           lxserver Web 端配置其他可用的自定义源(如换 meting 镜像、加 ikun)。
-
-        跨平台 fallback 留作 `_resolve_songmid_for_src` 方法,但目前不在
-        get_stream_details 里调用,留作未来扩展点。
+        So this method only:
+        1) loops qualities on the original source and lets the server try its
+           own custom APIs
+        2) health-checks the returned URL, since a broken gateway can still
+           answer 200 with an unusable body
+        3) gives up when no healthy URL is available, which means the user has
+           to enable another working custom source in the lxserver web UI
         """
         source, song_id = self._split_id(item_id)
         raw = getattr(self, "_raw_cache", {}).get(item_id)
-        # BUG #35: 只在原平台 source 上循环 quality,不做跨平台 fallback。
-        # 跨平台搜索匹配精度不够,会导致同名翻唱被错播。
+        # Loop qualities on the original source only. Cross-platform fallback is
+        # off because same-name matches play the wrong recording.
         sources_to_try = [source]
         tried: set[str] = set()
         last_err: str | None = None
 
-        # 从 raw 拆出 name/singer/interval (虽然不用作 fallback,但保留作日志/调试用)
+        # Pull name/singer/interval out of the raw item for logging only
         if raw:
             item_name = (raw.get("name") or raw.get("songName") or "").strip()
             singer_raw = raw.get("singer") or raw.get("singerName") or ""
@@ -1236,7 +2334,7 @@ class LxMusicProvider(MusicProvider):
             item_interval = ""
 
         LOGGER.debug(
-            "lxmusic: 开始获取播放链接 item_id=%s source=%s song_id=%s name=%r singer=%r interval=%r sources_to_try=%s",
+            "lxmusic: fetching playback url item_id=%s source=%s song_id=%s name=%r singer=%r interval=%r sources_to_try=%s",
             item_id, source, song_id, item_name, singer_name, item_interval, sources_to_try,
         )
 
@@ -1245,7 +2343,7 @@ class LxMusicProvider(MusicProvider):
                 continue
             tried.add(src)
 
-            # BUG #35: 跨平台 fallback 已禁用,只走原平台
+            # cross-platform fallback is disabled, original source only
             actual_songmid: str | None = None
             if raw:
                 actual_songmid = (
@@ -1257,9 +2355,9 @@ class LxMusicProvider(MusicProvider):
             else:
                 actual_songmid = song_id
 
-            # 优先使用缓存的完整 item 作为 songInfo；否则用最小结构。
-            # BUG #31 (2026-09-04) 修复: 强制覆盖为当前 src,确保切源时服务端能
-            # 正确识别目标平台。注意 songmid 不再用 setdefault,要写 actual_songmid
+            # Prefer the cached full item as songInfo, else a minimal one.
+            # Force the source to the one being tried so the server targets the
+            # right platform, and set songmid explicitly rather than defaulting.
             if raw:
                 song_info: dict[str, Any] = dict(raw)
                 song_info["source"] = src
@@ -1272,12 +2370,13 @@ class LxMusicProvider(MusicProvider):
                     "singer": singer_name,
                 }
             LOGGER.debug(
-                "lxmusic: 尝试源 src=%s songmid=%s (item_id=%s, songInfo.source=%s)",
+                "lxmusic: trying source src=%s songmid=%s (item_id=%s, songInfo.source=%s)",
                 src, actual_songmid, item_id, song_info.get("source"),
             )
-            # lxserver 的 /api/music/url 既可能读嵌套的 songInfo，也可能直接读
-            # 顶层的 source/songmid（Web 播放器实际发出的结构）。两者都带上，
-            # 确保服务端能正确识别平台并匹配到自定义源（如 ikun）。
+            # The server reads either a nested songInfo or top-level
+            # source/songmid, depending on the caller, so send both. That is the
+            # shape the web player posts, and it lets the server match custom
+            # sources.
             for quality in QUALITY_ORDER:
                 payload: dict[str, Any] = {
                     "songInfo": song_info,
@@ -1288,14 +2387,15 @@ class LxMusicProvider(MusicProvider):
                 }
                 try:
                     LOGGER.debug(
-                        "lxmusic: 请求播放链接 source=%s quality=%s songInfo=%s",
+                        "lxmusic: requesting playback url source=%s quality=%s songInfo=%s",
                         src, quality,
                         {k: v for k, v in song_info.items() if k in ("source", "songmid", "name", "singer")},
                     )
-                    # lxserver 的私有自定义源（如 ikun，Owner=admin）只在请求头
-                    # x-user-name 携带有效用户名、且经 x-user-token 校验通过时才会
-                    # 被纳入候选；否则只匹配公开源，导致 "未找到支持 X 平台的自定义源"。
-                    # 注意：用户名来自请求头而非 body 的 clientUsername 字段。
+                    # Private custom sources are only considered when the request
+                    # carries a valid x-user-name header that also passes the
+                    # x-user-token check; otherwise only public sources match and
+                    # the server reports no custom source for this platform.
+                    # The username comes from the header, not the body.
                     result = await self._request(
                         "POST",
                         "/api/music/url",
@@ -1303,44 +2403,38 @@ class LxMusicProvider(MusicProvider):
                         timeout=20,
                         extra_headers={"x-user-name": self._username},
                     )
-                    LOGGER.debug("lxmusic: 播放链接原始响应 source=%s quality=%s result=%s", src, quality, result)
+                    LOGGER.debug("lxmusic: playback url raw response source=%s quality=%s result=%s", src, quality, result)
                     url = self._extract_url(result)
                     if url:
-                        # BUG #33 健康检查: 网关挂了(如 metingapi.nanorocky.top
-                        # 被 CF 拦截)会返回 200 + 空内容,过滤掉
+                        # Health check: a blocked gateway answers 200 with an
+                        # empty body, which is not playable.
                         if not await self._check_url_playable(url):
-                            last_err = f"{src}/{quality}: URL 不可播放(网关挂了?) {url[:60]}"
+                            last_err = f"{src}/{quality}: url not playable (dead gateway?) {url[:60]}"
                             LOGGER.warning("lxmusic: %s", last_err)
                             continue
-                        # BUG #44 (2026-09-05) 双重保险识别 content_type:
-                        # 之前硬编码 ContentType.MP3,但 lxserver 在服务端"最高音质"
-                        # 设置下,实际可能返回 flac(典型 URL 末尾 .flac,典型 lxserver
-                        # 响应字段 type="flac")。硬编码 MP3 会让 amcfy 桥接给 APP
-                        # 发 Content-Type: audio/mpeg,APP 用 mp3 解码器解 flac 字节流
-                        # → 听起来"糊/破音"。先按 lxserver 响应里的 type 字段匹配,
-                        # 兜底再按 URL 后缀。
+                        # Determine content_type from the server response rather
+                        # than hardcoding MP3: with the server set to highest
+                        # quality it may return flac, and labeling those bytes
+                        # audio/mpeg makes clients decode flac with an mp3
+                        # decoder, which sounds distorted. Match the type field
+                        # first, then fall back to the URL suffix.
                         ct = self._pick_content_type(result, url, quality)
                         LOGGER.debug(
-                            "lxmusic: 成功获取播放链接 %s -> %s (quality=%s content_type=%s)",
+                            "lxmusic: playback url ok %s -> %s (quality=%s content_type=%s)",
                             item_id, url[:120], quality, ct,
                         )
-                        # BUG #101 (2026-09-07): StreamDetails 必须设
-                        # allow_seek=True,否则 MA stream controller 默认 False
-                        # 会把用户拖进度条的 seek_position 重置为 0
-                        # (audio.py:699-701 "seeking is not possible on this
-                        # stream!"),体感"拖动进度条无效定位"。
+                        # allow_seek must be set, otherwise the MA stream
+                        # controller resets a requested seek position to 0 and
+                        # the progress bar appears to do nothing.
                         #
-                        # can_seek=True 只表示 MA 可以尝试在 byte 流里 seek;
-                        # allow_seek=True 才是 provider 主动声明 URL 支持
-                        # Range 请求。对照: tidal/streaming.py:156、
-                        # filesystem_local/__init__.py:3437-3548 都显式设
-                        # allow_seek=True。
+                        # can_seek only says MA may seek within the byte stream;
+                        # allow_seek is the provider asserting the URL supports
+                        # range requests, as tidal and the local provider do.
                         #
-                        # 风险: 少数 lxserver 自定义源(如某些 meting 镜像)
-                        # 可能不支持 Range。但 amcfy 网桥已经有 BUG #6/#58/#59
-                        # 网易云 Range 偷换 + 嗅探魔数 + 完整拉 + 切片转发保护,
-                        # MA webui 直接播放走原生 Range,网易云 WY 源走 amcfy
-                        # 时已有 host 黑名单兜底,本改动不影响 amcfy 网桥逻辑。
+                        # Risk: a few custom sources may not support ranges, but
+                        # the amcfy bridge already sniffs magic bytes and guards
+                        # such hosts, and the MA web UI plays with native ranges,
+                        # so this does not change bridge behaviour.
                         return StreamDetails(
                             item_id=item_id,
                             provider=self.instance_id,
@@ -1350,21 +2444,21 @@ class LxMusicProvider(MusicProvider):
                             can_seek=True,
                             allow_seek=True,
                         )
-                    # 有响应但没提取到 url，记录一下帮助排查
+                    # Response arrived but carried no usable url; log it for triage
                     LOGGER.debug(
-                        "lxmusic: 响应中未提取到URL source=%s quality=%s result=%s",
+                        "lxmusic: no url extracted from response source=%s quality=%s result=%s",
                         src, quality, result,
                     )
                 except Exception as err:  # noqa: BLE001
                     last_err = f"{src}/{quality}: {err}"
-                    LOGGER.warning("lxmusic: 获取播放链接失败 %s", last_err)
+                    LOGGER.warning("lxmusic: playback url attempt failed %s", last_err)
                     continue
 
         LOGGER.error(
-            "lxmusic: 无法获取 %s 的播放链接！已尝试源 %s，最后错误: %s。"
-            "请确认：1) lxserver 设置中对应平台的自定义源已启用；"
-            "2) 该歌曲在 lxserver Web 播放器中可正常播放。",
-            item_id, list(tried), last_err or "(无)",
+            "lxmusic: no playback url for %s; tried sources %s, last error: %s. "
+            "Check that 1) a custom source for that platform is enabled in lxserver "
+            "and 2) the track plays in the lxserver web player.",
+            item_id, list(tried), last_err or "(none)",
         )
         return None
 
@@ -1382,21 +2476,282 @@ class LxMusicProvider(MusicProvider):
         return out
 
     # ------------------------------------------------------------------ #
-    # Library sync (LX Server has no standard favorites API)
+    # Library sync (love list into MA favorites)
     # ------------------------------------------------------------------ #
-    async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
-        """Return empty; LX Server has no favorites API.
+    def _sync_love_list_enabled(self) -> bool:
+        """Love-list sync toggle from the sync_love_list config entry, on by default.
 
-        2026-09-04 BUG 修复:基类 ``MusicProvider.get_library_tracks`` 是
-        ``async def ... AsyncGenerator[Track]``（用 ``async for`` 消费），
-        原实现写成 ``return []`` 普通协程，会被框架的同步任务
-        （``models/music_provider.py:1657`` ``async for prov_item in
-        self.get_library_tracks()``）报错 ``'async for' requires an object
-        with __aiter__ method, got coroutine``。这里改为异步生成器
-        （``if False: yield`` 保持生成器签名）即可。
+        Read through get_setup_value on every use, like the radio interval, so
+        a change in MA settings takes effect without restarting MA. A BOOLEAN
+        entry may arrive as a string such as "false", so parse it here.
+        """
+        raw = self.get_setup_value(CONF_SYNC_LOVE_LIST, True)
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ("false", "0", "off", "no", "")
+        return bool(raw)
+
+    async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
+        """Yield the lxserver love list as the source of MA library favorites.
+
+        This is the LX -> MA direction: the built-in library sync task consumes
+        this generator, adds each track to the library and marks it favorite.
+        The framework writes that flag straight to the database without calling
+        this provider's set_favorite, so there is no feedback loop.
+
+        When a song is unhearted on the lxserver side it disappears from this
+        generator, and the framework's deletion branch then drops it from MA
+        favorites, which relies on the library_sync_deletions core setting.
+
+        The `if False: yield` below keeps this an async generator on purpose:
+        the framework consumes it with `async for`, and a plain coroutine
+        returning a list would fail.
         """
         if False:  # noqa: SIM901
             yield  # type: ignore[misc]
+        if not self._sync_love_list_enabled():
+            LOGGER.debug("lxmusic: love-list sync disabled, yielding nothing")
+            return
+        # Library sync is infrequent, so bypass the TTL and fetch the current
+        # love list to reflect hearts added or removed just before this run.
+        self._user_lists_cache_time = 0.0
+        data = await self._get_user_lists()
+        if not isinstance(data, dict):
+            LOGGER.warning("lxmusic: love-list sync could not read /api/user/list, skipping")
+            return
+        love_items: list[dict[str, Any]] = []
+        for pl_id, _name, songs in self._iter_user_playlists(data):
+            if pl_id == "__love__":
+                love_items = songs
+                break
+        LOGGER.info("lxmusic: love-list sync has %d tracks", len(love_items))
+        for item in love_items:
+            if not isinstance(item, dict):
+                continue
+            source = str(item.get("source") or self._default_source)
+            try:
+                track = await self._parse_track(item, source)
+            except Exception as err:  # noqa: BLE001
+                LOGGER.warning(
+                    "lxmusic: love-list track parse failed %r: %s",
+                    self._item_song_id(item) if isinstance(item, dict) else item,
+                    err,
+                )
+                continue
+            if not track:
+                continue
+            # the framework uses this to favorite library items not yet favorited
+            track.favorite = True
+            yield track
+
+    async def set_favorite(
+        self, prov_item_id: str, media_type: MediaType, favorite: bool
+    ) -> None:
+        """MA -> LX direction: write the user's favorite toggle back to the love list.
+
+        MA only calls this once FAVORITE_TRACKS_EDIT is declared, and only for
+        tracks. The server endpoints are:
+        - add: POST /api/music/user/list/add with listId "love", the full
+          MusicInfo and a location; it dedupes by musicInfo.id, so it is idempotent
+        - remove: POST /api/music/user/list/remove with listId "love" and the
+          song id; removing an absent entry also succeeds
+        Both answer with plain text rather than JSON, so these go through
+        _request_text; the shared _request would fail to parse the body.
+
+        Adding needs a complete MusicInfo while MA only gives us the provider
+        item id, and song search does not accept a songmid, so the raw item is
+        taken from, in order:
+        1. _raw_cache, from an earlier search, listing or love-list sync;
+        2. the current love list cache, in case it is already there;
+        3. get_track for the metadata, then a re-search by name and artist for
+           the full MusicInfo.
+        If none of that works, raise: a favorite the user set should fail
+        visibly rather than be dropped silently.
+        """
+        if media_type != MediaType.TRACK:
+            # Only FAVORITE_TRACKS_EDIT is declared, so other media types should
+            # not arrive; ignore them quietly rather than raising into the UI.
+            LOGGER.debug(
+                "lxmusic: set_favorite ignoring non-track type %s: %s", media_type, prov_item_id
+            )
+            return
+        if not self._sync_love_list_enabled():
+            raise RuntimeError(
+                "LX Music love-list sync is disabled, so the favorite cannot be "
+                "written back. Enable it in MA settings -> LX Music -> Configure."
+            )
+        source, song_id = self._split_id(prov_item_id)
+        if not song_id:
+            raise RuntimeError(f"LX Music cannot parse track id: {prov_item_id!r}")
+
+        if favorite:
+            music_info = await self._love_music_info(prov_item_id, source, song_id)
+            # The server dedupes and removes entries by musicInfo.id, but search
+            # results only carry songmid, so set id explicitly or add fails.
+            music_info["id"] = song_id
+            resp = await self._request_text(
+                "POST",
+                "/api/music/user/list/add",
+                data={
+                    "listId": "love",
+                    "musicInfos": [music_info],
+                    "location": "top",
+                },
+            )
+            LOGGER.info(
+                "lxmusic: hearting %s:%s (%s) -> %s",
+                source, song_id, music_info.get("name"), resp[:80],
+            )
+        else:
+            resp = await self._request_text(
+                "POST",
+                "/api/music/user/list/remove",
+                data={"listId": "love", "songIds": [song_id]},
+            )
+            LOGGER.info("lxmusic: unhearting %s:%s -> %s", source, song_id, resp[:80])
+
+        # Invalidate the user-list cache after a successful write so the next
+        # library sync or playlist listing sees the new state right away.
+        self._user_lists_cache_time = 0.0
+        self._playlist_cache.pop("__love__", None)
+
+    async def _request_text(
+        self,
+        method: str,
+        path: str,
+        *,
+        data: dict[str, Any] | None = None,
+    ) -> str:
+        """POST/GET and return the body as text, tolerating non-JSON responses.
+
+        The love-list write endpoints answer plain text on success, which the
+        shared _request would break on since it always calls resp.json().
+        Non-2xx raises with the body included, which is what makes server-side
+        validation errors such as missing listId diagnosable.
+        """
+        headers: dict[str, str] = {}
+        if self._token:
+            headers["x-user-token"] = self._token
+        url = f"{self._server_url}{path}"
+        session = self._session()
+        async with session.request(method, url, json=data, headers=headers) as resp:
+            if resp.status == 401:
+                await self._login()
+                headers["x-user-token"] = self._token or ""
+                async with session.request(
+                    method, url, json=data, headers=headers
+                ) as resp2:
+                    body = await resp2.text()
+                    if resp2.status >= 400:
+                        raise RuntimeError(
+                            f"HTTP {resp2.status} {resp2.reason} body: {body[:500]}"
+                        )
+                    return body.strip()
+            body = await resp.text()
+            if resp.status >= 400:
+                raise RuntimeError(
+                    f"HTTP {resp.status} {resp.reason} body: {body[:500]}"
+                )
+            return body.strip()
+
+    async def _love_music_info(
+        self, prov_item_id: str, source: str, song_id: str
+    ) -> dict[str, Any]:
+        """Build a full LX.Music.MusicInfo for hearting, raising if impossible.
+
+        MA only gives us the provider item id, while the add endpoint needs a
+        complete MusicInfo. Song search does not accept a songmid as keyword, so
+        the info cannot be rebuilt that way. Sources, fastest first:
+        1. _raw_cache, left behind by an earlier search, listing or sync of this track;
+        2. the user playlist cache, which includes the love list;
+        3. the MA database, looked up by provider item id, to get name and artist
+           and then search for them;
+        4. get_track, which works on the few platforms where songmid is searchable;
+        5. as a last resort assemble one from the metadata we do have; missing
+           fields still store fine.
+        """
+        key = f"{source}:{song_id}"
+        # 1) fastest: raw item cached by any earlier path that resolved this track
+        raw = self._raw_cache.get(key)
+        if isinstance(raw, dict) and raw.get("name"):
+            return dict(raw)
+        # 2) already present in the user playlist or love list cache
+        data = await self._get_user_lists()
+        if isinstance(data, dict):
+            for _pl_id, _name, songs in self._iter_user_playlists(data):
+                for item in songs:
+                    if (
+                        isinstance(item, dict)
+                        and str(item.get("source") or source) == source
+                        and self._item_song_id(item) == song_id
+                        and item.get("name")
+                    ):
+                        return dict(item)
+        # 3) look the item up in the MA library: the framework adds it to the
+        #    library before forwarding the favorite, so name and artist are
+        #    normally available here without any network search.
+        db_track = None
+        try:
+            db_track = await self.mass.music.tracks.get_library_item_by_prov_id(
+                prov_item_id, self.instance_id
+            )
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: library lookup failed %s: %s", prov_item_id, err)
+        meta = db_track or await self._love_meta_fallback(prov_item_id)
+        if meta is None:
+            raise RuntimeError(
+                f"Track {prov_item_id} is known neither to lxserver nor to Music "
+                "Assistant and cannot be hearted (it may have left the source platform)."
+            )
+        # 4) re-search by name plus artist to get the server's full MusicInfo
+        singer = ""
+        artists = list(getattr(meta, "artists", None) or [])
+        if artists:
+            singer = str(getattr(artists[0], "name", "") or "")
+        keyword = f"{getattr(meta, 'name', '') or ''} {singer}".strip()
+        if keyword:
+            for item in await self._search_source(source, keyword, page_size=20):
+                if not isinstance(item, dict):
+                    continue
+                if self._item_song_id(item) == song_id and item.get("name"):
+                    return dict(item)
+            # no exact id for the combined query: retry with the bare track name
+            name_only = str(getattr(meta, "name", "") or "").strip()
+            if name_only and name_only != keyword:
+                for item in await self._search_source(source, name_only, page_size=30):
+                    if (
+                        isinstance(item, dict)
+                        and self._item_song_id(item) == song_id
+                        and item.get("name")
+                    ):
+                        return dict(item)
+        # 5) last resort: assemble from metadata. The server only requires
+        #    listId and a musicInfos array, so missing fields still store, and
+        #    the LX client may re-match the track when it opens it.
+        LOGGER.warning(
+            "lxmusic: %s could not be rebuilt from search, hearting from metadata", prov_item_id
+        )
+        return {
+            "name": getattr(meta, "name", "") or "未知歌曲",
+            "singer": "、".join(
+                str(getattr(a, "name", "") or "") for a in artists
+                if getattr(a, "name", "")
+            ) or "未知歌手",
+            "source": source,
+            "songmid": song_id,
+            "albumName": getattr(getattr(meta, "album", None), "name", "") or "",
+            "albumId": getattr(getattr(meta, "album", None), "item_id", "") or "",
+            "interval": _normalize_lx_interval(getattr(meta, "duration", 0)),
+            "types": [{"type": "128k", "size": "0"}, {"type": "320k", "size": "0"}],
+        }
+
+    async def _love_meta_fallback(self, prov_item_id: str) -> Any:
+        """Last attempt before giving up: fetch metadata through get_track."""
+        try:
+            return await self.get_track(prov_item_id)
+        except Exception as err:  # noqa: BLE001
+            LOGGER.debug("lxmusic: get_track(%s) fallback failed: %s", prov_item_id, err)
+            return None
+
 
     async def get_library_albums(self) -> AsyncGenerator[Album, None]:
         """Return empty; LX Server has no favorites API."""
@@ -1409,27 +2764,26 @@ class LxMusicProvider(MusicProvider):
             yield  # type: ignore[misc]
 
     async def get_library_playlists(self) -> AsyncGenerator[Playlist, None]:
-        """Yield user-owned playlists (webplayer + loveList) to MA library.
+        """Yield user-owned playlists (webplayer + love list) to the MA library.
 
-        2026-09-06 BUG #80: virtual playlists (LX leaderboards / square /
-        defaultList "我最近播放") are NOT yielded here -- they live in
-        ``#/browse`` only. Browse paths call ``_collect_virtual_meta()`` to
-        populate ``_virtual_meta`` cache, then construct ItemMapping entries.
+        Virtual playlists (leaderboards, square picks, the recent-play list) are
+        not yielded here; they are exposed through browse only, which populates
+        the _virtual_meta cache via _collect_virtual_meta().
 
         Yield order:
-        - ``__love__`` ("洛雪收藏")
-        - userList webplayer_* (LX server user-created local playlists)
+        - the love list
+        - playlists the user created in the lxserver web player
         """
         data = await self._get_user_lists()
         if data:
             for pid, pname, songs in self._iter_user_playlists(data):
-                # BUG #80: skip defaultList ("我最近播放"). It is a virtual
-                # playlist exposed only via browse path "{instance_id}://playlists/recent".
+                # Skip the recent-play list: it is a virtual playlist exposed
+                # only through the browse path playlists/recent.
                 if pid == "__default__":
                     continue
                 item_id = f"list:{pid}"
                 self._playlist_cache[item_id] = songs
-                # 2026-09-04 Task #42: 用第一首歌的封面做歌单封面。
+                # Use the first track's cover as the playlist cover.
                 first_song = songs[0] if songs else None
                 first_pic = ""
                 if isinstance(first_song, dict):
@@ -1465,37 +2819,33 @@ class LxMusicProvider(MusicProvider):
     def _library_item_needs_update(
         self, library_item, prov_item
     ) -> bool:
-        """判断 library 里的 LX 歌单是否需要 update。
+        """Decide whether a library playlist needs an update.
 
-        2026-09-04 简化 LX 广场歌单命名后,DB 里 50 个旧双层名字(`LX 歌单·主题·70后:...`)
-        没被新 sync 更新。原因:基类 ``_library_item_needs_update`` 只看
-        ``provider_mappings`` 和 ``date_added``,不看 ``name`` —— LX 虚拟歌单
-        的 item_id 稳定,但 name 是从 display 模板动态生成的,改模板后老名字
-        永远不会被覆盖,只能等 deletion(同步库不会删除相同 item_id 的歌单)。
+        The base implementation compares provider mappings and date added only,
+        never the name. Virtual playlist ids are stable while their names are
+        generated from a display template, so after a template change the stored
+        names would never be refreshed.
 
-        这里 override 加 name 比较:如果 sync 发现 name 不同就触发 update。
-        对用户歌单(``list:default`` / ``list:love`` / ``list:user:<id>``)也安全
-        —— 用户歌单名改了 MA 也会跟着 update。
+        This override also compares names, which is safe for user playlists too:
+        renaming one there should update the library entry as well.
 
-        2026-09-04 Task #42 扩展:再加 images 比较。LX 虚拟歌单封面来自 lxserver
-        详情页第一首的 pic,这个字段在 sync 流程里不在 sync_details 比较里
-        (MA base 用 ``LibraryItemSyncDetails`` 只看 scalar 列),所以即使
-        yield 时带了 metadata.images,只要 name 没变 DB 里旧 image 就一直
-        是 null。这里把 images path 也纳入比较,封面变了就触发 update。
+        Images are compared on top of that. Covers come from the first track of
+        the detail page and are not part of the base sync comparison, so without
+        this a stored cover would stay empty forever as long as the name held.
         """
         base = super()._library_item_needs_update(library_item, prov_item)
         lib_name = getattr(library_item, "name", None)
         prov_name = getattr(prov_item, "name", None)
         name_differs = lib_name != prov_name
 
-        # 比较 images:取第一张 THUMB 的 path,简化成 url 字符串集合
+        # compare covers: reduce the first thumbnail to its path
         def _first_thumb_path(item) -> str:
             meta = getattr(item, "metadata", None)
             if not meta:
                 return ""
             images = getattr(meta, "images", None) or []
             for img in images:
-                # ImageType 可能不暴露 .value, 退化为 str 比较
+                # ImageType may not expose .value, fall back to comparing as text
                 t = getattr(img, "type", None)
                 if str(t).endswith("THUMB") or str(t) == "thumb" or str(t) == "ImageType.THUMB":
                     return (getattr(img, "path", "") or "").strip()
@@ -1506,18 +2856,14 @@ class LxMusicProvider(MusicProvider):
         image_differs = lib_img != prov_img
 
         needs = base or name_differs or image_differs
-        # INFO 级日志,即使 logger level 设到 INFO 也能看到 —— DEBUG 没出现
-        # 是因为 LX provider 主 logger 在 sync 阶段被替换为 MusicProvider 的
-        # ``self.logger``(见 music_provider.py sync 流程),而我们 LOGGER 指向
-        # ``music_assistant.providers.lxmusic``(provider __name__),二者其实是
-        # 同一个 logger,但下游 code 调用 super() 后 LOG 走 self.logger
-        # (provider 级)。这里强制 INFO 方便观察。
-        # 2026-09-04 配合 _cleanup_double_layer_names,override 这里日志
-        # 改回 DEBUG,不让同步时刷出几十行 WARNING。但用户在 MA UI 里把 LX
-        # provider logger 设到 DEBUG 就能看到。
+        # Logged at INFO so it is visible without raising the log level. During
+        # sync the provider logger is swapped for the framework's own, which
+        # points at the same logger, and the super() call below logs through it.
+        # Kept at DEBUG rather than WARNING so a sync does not emit dozens of
+        # warning lines; it is still visible with the provider logger at DEBUG.
         if (name_differs and not base) or image_differs:
             LOGGER.debug(
-                "lxmusic: 触发 update | lib_id=%s prov_item_id=%s name_diff=%s image_diff=%s (lib=%r prov=%r)",
+                "lxmusic: update triggered | lib_id=%s prov_item_id=%s name_diff=%s image_diff=%s (lib=%r prov=%r)",
                 getattr(library_item, "item_id", "?"),
                 getattr(prov_item, "item_id", "?"),
                 name_differs, image_differs,
@@ -1525,34 +2871,30 @@ class LxMusicProvider(MusicProvider):
             )
         return needs
 
-    # 2026-09-04 简化 LX 广场歌单命名:把 DB 残留的 'LX 歌单·X·Y:...' 双层
-    # 名字直接改成单层 'LX 歌单·Y:...'。
+    # One-off cleanup of legacy square playlist names.
     #
-    # 必要性:``_library_item_needs_update`` override 只在 sync yield 同
-    # item_id 时触发,但 ``get_library_playlists`` 每个 tag 只取 top-N
-    # (``_LEADERBOARD_TOPN=5``),老的 sl_id 不在 top-N 里就 yield 不到,
-    # override 没机会跑,DB 残留几百条双层名字。这里在 sync 启动后跑一次
-    # 直接 DB UPDATE,绕过 sync 范围限制,把残留的双层全部简化。
+    # The name comparison above only runs when a sync yields the same item id,
+    # but only the top N playlists per tag are yielded, so stale entries outside
+    # that set never get a chance to be renamed. This runs a direct database
+    # update instead, which is not limited by the sync scope.
     #
-    # 2026-09-04 二次简化:用户进一步要求去掉"歌单"两字,新模板
-    # ``LX ·<tag>:<name>``。cleanup 同步把 ``LX 歌单·<tag>:<name>`` 改成
-    # ``LX ·<tag>:<name>``。一次 regex 同时兼容双层 ``LX 歌单·X·Y:Z`` 和
-    # 单层 ``LX 歌单·Y:Z`` 两种历史格式(双层用 group(3)、单层用 group(2))。
+    # The current template is ``LX ·<tag>:<name>``. One regex handles both the
+    # historical two-layer and single-layer forms, taking the final tag from
+    # group 2 and the remainder from group 3.
     _SONGLIST_NAME_RE = re.compile(r"^(LX )歌单·(?:[^·]+·)?([^·:]+)(:.*)$")
 
     async def _cleanup_double_layer_names(self) -> None:
-        """把 DB 里 LX 广场歌单的名字统一改成 ``LX ·<tag>:<name>``。
+        """Rename stored square playlists in the database to ``LX ·<tag>:<name>``.
 
-        直接用 ``self.mass.music.database.update`` 改 playlists.name,
-        不用 ``update_item_in_library`` —— 避免触发 ``MEDIA_ITEM_UPDATED``
-        事件干扰用户当前播放;前端下次拉 playlist 列表会看到新名字。
+        Updates playlists.name through the database directly rather than
+        update_item_in_library, so no MEDIA_ITEM_UPDATED event fires and
+        interrupts playback; the UI picks the new names up on its next fetch.
         """
         pattern = self._SONGLIST_NAME_RE
         db = self.mass.music.database
-        # JOIN provider_mappings 过滤 LX provider 的歌单,避免误改其他 provider。
-        # 注意:不要 ``GROUP BY``,只用 ``DISTINCT``,因为 aiosqlite Row 在
-        # ``iter_rows_from_query`` 里没有标准 Mapping 接口,用 row[0]/row[1]
-        # 按位置访问最稳。
+        # Join provider mappings to touch only LX playlists. Avoid GROUP BY and
+        # use DISTINCT only: rows come back without a standard mapping
+        # interface, so positional access is the reliable option.
         query = (
             "SELECT DISTINCT pl.item_id, pl.name "
             "FROM playlists pl "
@@ -1567,9 +2909,9 @@ class LxMusicProvider(MusicProvider):
             async for row in db.iter_rows_from_query(
                 query, params={"domain": self.domain}
             ):
-                # aiosqlite.Row 是 sqlite3.Row 的别名,既支持 row[0]/row[1]
-                # 按位置访问,又支持 row['item_id'] 按名字访问。统一按位置
-                # 访问,避免命名 dict 解析失败导致漏清理。
+                # The row type supports both positional and by-name access; use
+                # positional consistently so a parsing hiccup cannot cause an
+                # entry to be skipped.
                 item_id = row[0]
                 old_name = row[1] or ""
                 if not item_id:
@@ -1578,8 +2920,8 @@ class LxMusicProvider(MusicProvider):
                 if not m:
                     skipped += 1
                     continue
-                # group(1)="LX ", group(2)=<tag>(无论双层/单层都拿到最终 tag),
-                # group(3)=:<rest>
+                # group(1) is the prefix, group(2) the final tag in both the
+                # two-layer and single-layer forms, group(3) the remainder.
                 new_name = f"LX ·{m.group(2)}{m.group(3)}"
                 if new_name == old_name:
                     skipped += 1
@@ -1593,20 +2935,20 @@ class LxMusicProvider(MusicProvider):
                     cleaned += 1
                     if cleaned <= 3 or cleaned % 100 == 0:
                         LOGGER.info(
-                            "lxmusic: 歌单名 cleanup | item_id=%s '%s' -> '%s'",
+                            "lxmusic: playlist name cleanup | item_id=%s '%s' -> '%s'",
                             item_id, old_name, new_name,
                         )
                 except Exception as err:  # noqa: BLE001
                     failed += 1
                     LOGGER.debug(
-                        "lxmusic: 歌单名 cleanup 失败 | item_id=%s err=%s",
+                        "lxmusic: playlist name cleanup failed | item_id=%s err=%s",
                         item_id, err,
                     )
         except Exception as err:  # noqa: BLE001
-            LOGGER.debug("lxmusic: 歌单名 cleanup query 失败: %s", err)
+            LOGGER.debug("lxmusic: playlist name cleanup query failed: %s", err)
             return
         LOGGER.info(
-            "lxmusic: 歌单名 cleanup 完成 | cleaned=%d skipped=%d failed=%d",
+            "lxmusic: playlist name cleanup done | cleaned=%d skipped=%d failed=%d",
             cleaned, skipped, failed,
         )
 
@@ -1732,7 +3074,7 @@ class LxMusicProvider(MusicProvider):
             )
 
     async def get_artist_albums(self, prov_artist_id: str) -> list[Album]:
-        """歌手专辑：优先 artistAlbums（需真实歌手 ID），否则按歌手名回搜聚合。"""
+        """Artist albums: artistAlbums when a real artist id exists, else aggregate a search by name."""
         info = self._artist_cache.get(prov_artist_id)
         if not info:
             source, name = self._split_id(prov_artist_id)
@@ -1758,9 +3100,9 @@ class LxMusicProvider(MusicProvider):
                     )
                     albums.append(self._register_album(source, aname, aid_real))
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("artistAlbums 失败 %s: %s", prov_artist_id, err)
+                LOGGER.debug("artistAlbums failed %s: %s", prov_artist_id, err)
         if not albums:
-            # 兜底：按歌手名回搜，按专辑名聚合
+            # fallback: search by artist name and group the hits by album name
             seen_albums: set[str] = set()
             for src in self._search_sources:
                 items = await self._search_source(src, name, page_size=30)
@@ -1778,7 +3120,7 @@ class LxMusicProvider(MusicProvider):
         return albums
 
     async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
-        """歌手热门：优先 artistSongs（需真实歌手 ID），否则按歌手名回搜过滤。"""
+        """Artist top tracks: artistSongs when a real artist id exists, else search by name and filter."""
         info = self._artist_cache.get(prov_artist_id)
         if not info:
             source, name = self._split_id(prov_artist_id)
@@ -1799,9 +3141,9 @@ class LxMusicProvider(MusicProvider):
                     if track:
                         tracks.append(track)
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("artistSongs 失败 %s: %s", prov_artist_id, err)
+                LOGGER.debug("artistSongs failed %s: %s", prov_artist_id, err)
         if not tracks:
-            # 兜底：按歌手名回搜并过滤同名歌手
+            # fallback: search by artist name and keep matching artists only
             for src in self._search_sources:
                 items = await self._search_source(src, name, page_size=30)
                 for item in items:
@@ -1812,7 +3154,7 @@ class LxMusicProvider(MusicProvider):
                             tracks.append(track)
                 if len(tracks) >= 20:
                     break
-        # 去重
+        # dedupe
         seen: set[str] = set()
         out: list[Track] = []
         for track in tracks:
@@ -1833,7 +3175,7 @@ class LxMusicProvider(MusicProvider):
 
     @staticmethod
     def _item_song_id(item: dict[str, Any]) -> str:
-        """服务端搜索结果的 ID 字段为 songmid。"""
+        """Search results identify songs by songmid."""
         return str(
             item.get("songmid")
             or item.get("songId")
@@ -1843,7 +3185,7 @@ class LxMusicProvider(MusicProvider):
 
     @staticmethod
     def _album_id(item: dict[str, Any]) -> str | None:
-        """兼容 albumId / albumid / album_id 等多种字段名。"""
+        """Accept the various spellings of the album id field."""
         for key in ("albumId", "albumid", "album_id"):
             value = item.get(key)
             if value:
@@ -1852,10 +3194,11 @@ class LxMusicProvider(MusicProvider):
 
     @staticmethod
     def _singer_info(item: dict[str, Any]) -> tuple[list[str], str | None]:
-        """解析歌手名列表与真实歌手 ID。
+        """Extract artist names and the real artist id.
 
-        lxserver 的 singer 可能是字符串（"周杰伦" 或 "A/B"），
-        也可能是数组（[{name, id, mid}, ...]）。统一返回 (名字列表, 真实ID)。
+        The singer field may be a string, possibly several names separated by
+        slashes, or a list of objects with name/id/mid. Always returns a
+        (names, real_id) pair.
         """
         singer = item.get("singer") or item.get("artist") or ""
         names: list[str] = []
@@ -1914,7 +3257,7 @@ class LxMusicProvider(MusicProvider):
         )
 
     # ------------------------------------------------------------------ #
-    # 缓存 / 回查辅助
+    # Cache and lookup helpers
     # ------------------------------------------------------------------ #
     def _artist_item_id(self, source: str, name: str) -> str:
         return f"{source}:{hashlib.md5(name.encode()).hexdigest()[:12]}"
@@ -1944,40 +3287,94 @@ class LxMusicProvider(MusicProvider):
     async def _fetch_paged(
         self, path: str, params: dict[str, Any], max_items: int = 50
     ) -> list[dict[str, Any]]:
-        """分页拉取 lxserver 列表接口（artistSongs/artistAlbums/songList/detail 等）。"""
+        """Page through lxserver list endpoints such as artistSongs or songList/detail.
+
+        The server answers HTTP 500 with {"error": "try max num"} for an
+        out-of-range page or when concurrency is exceeded, rather than an empty
+        list. Letting that escape made whole playlists look empty even when the
+        first page had succeeded, so:
+        - each page is retried up to 3 times with backoff to ride out throttling
+        - a failure on page 1 is raised, since the caller must know nothing was fetched
+        - a failure on a later page ends pagination and the partial result is kept
+
+        Also note that songList/detail ignores page and limit and returns the
+        entire list every time, so a short-page check would never terminate.
+        Items are deduped by key instead, and a page with no new entries ends it.
+        """
         items: list[dict[str, Any]] = []
+        seen: set[str] = set()
         page = 1
         while len(items) < max_items:
-            batch = self._normalize_list(
-                await self._request(
-                    "GET",
-                    path,
-                    params={**params, "page": page, "limit": 50},
+            batch: list[dict[str, Any]] = []
+            last_err: Exception | None = None
+            for retry in range(3):
+                try:
+                    batch = self._normalize_list(
+                        await self._request(
+                            "GET",
+                            path,
+                            params={**params, "page": page, "limit": 50},
+                        )
+                    )
+                    last_err = None
+                    break
+                except Exception as err:  # noqa: BLE001
+                    last_err = err
+                    if retry < 2:
+                        await asyncio.sleep(0.4 * (2**retry))
+            if last_err is not None:
+                if page == 1:
+                    raise last_err
+                LOGGER.debug(
+                    "lxmusic: %s page %d failed, treating as end of list (%d kept): %s",
+                    path, page, len(items), last_err,
                 )
-            )
+                break
             if not batch:
                 break
-            items.extend(batch)
+            added = 0
+            for entry in batch:
+                key = self._paged_item_key(entry, len(items) + added)
+                if key in seen:
+                    continue
+                seen.add(key)
+                items.append(entry)
+                added += 1
+            if not added:
+                # the server ignored pagination, or the list really ended
+                break
             if len(batch) < 50:
                 break
             page += 1
         return items[:max_items]
 
+    @staticmethod
+    def _paged_item_key(entry: Any, fallback_index: int) -> str:
+        """Stable dedup key for a paged item; non-dicts fall back to the index so they are never dropped."""
+        if not isinstance(entry, dict):
+            return f"pos:{fallback_index}"
+        for key in ("songmid", "songId", "id", "mid", "bangid", "dissid"):
+            val = entry.get(key)
+            if val:
+                return f"{entry.get('source', '')}:{key}:{val}"
+        return (
+            f"name:{entry.get('name', '')}|{entry.get('singer', '')}"
+            f"|{entry.get('interval', '')}"
+        )
+
     async def _get_leaderboard_tracks(
         self, source: str, bangid: str, page: int = 0
     ) -> list[Track]:
-        """获取排行榜内的歌曲(虚拟歌单 list:board: 派发)。
+        """Leaderboard tracks, dispatched from the list:board: virtual playlist.
 
-        2026-09-04 BUG #36: lxserver /api/music/leaderboard/list 返回
-        ``{list, total, page, limit, source}``,list 每首含 songmid (纯数字)
-        所以能直接走对应平台官方源播放,无需再做前缀剥除。
+        The leaderboard endpoint returns a plain list whose entries carry a
+        numeric songmid, so playback goes straight through the official source
+        for that platform with no prefix stripping.
 
-        BUG #95 (2026-09-07): 原代码永远传 ``page=1``,不管 MA 要第几页。
-        MA playlists.tracks() 以 page=0,1,2 递增调用本方法,永远拿 page=1
-        的数据 → 排行榜 >100 首时拿不全 → 客户端"没歌曲"体感。同时
-        page=1 对应数据已经切片过 start..start+page_size,MA 看到 100 条
-        又会继续请求下一页 → 无谓重复拉取。本方法直接传 MA 给的
-        page(MA 是 0-based,lxserver 是 1-based,+1 对齐)。
+        The MA page argument must be forwarded: MA calls with page=0,1,2,... and
+        always requesting page 1 both truncates boards longer than one page and
+        makes MA ask for pages that repeat data. MA is 0-based and the server is
+        1-based, hence the +1.
         """
         page_size = 100
         start = page * page_size
@@ -1988,7 +3385,7 @@ class LxMusicProvider(MusicProvider):
                 params={"source": source, "bangid": bangid, "page": page + 1},
             )
         except Exception as err:  # noqa: BLE001
-            LOGGER.debug("lxmusic: 排行榜拉取失败 %s/%s: %s", source, bangid, err)
+            LOGGER.debug("lxmusic: leaderboard fetch failed %s/%s: %s", source, bangid, err)
             return []
         items: list[dict[str, Any]] = []
         if isinstance(data, dict):
@@ -1999,7 +3396,7 @@ class LxMusicProvider(MusicProvider):
         for item in items[start : start + page_size]:
             if not isinstance(item, dict):
                 continue
-            # 排行榜 songmid 已是纯数字, _parse_track 的剥前缀分支不会触发
+            # leaderboard songmids are already numeric, no prefix to strip
             track = await self._parse_track(item, source)
             if track:
                 out.append(track)
@@ -2008,13 +3405,18 @@ class LxMusicProvider(MusicProvider):
     async def _get_songlist_tracks(
         self, source: str, sl_id: str, page: int = 0
     ) -> list[Track]:
-        """获取广场精选歌单的歌曲(虚拟歌单 list:songlist: 派发)。
+        """Square playlist tracks, dispatched from the list:songlist: virtual playlist.
 
-        2026-09-04 BUG #36: 调 /api/music/songList/detail, 歌曲 songmid 是
-        纯数字(由服务端绑定到对应 source 的官方库)。
+        Fetched through songList/detail; the songmids are numeric and already
+        bound to the right platform by the server.
         """
         page_size = 100
         start = page * page_size
+        # The track path may run before get_playlist, so make sure the metadata
+        # exists here too; a cache hit costs nothing. Otherwise the playlist
+        # title degrades to the raw item id.
+        if page == 0 and not self._virtual_meta.get(f"list:songlist:{source}:{sl_id}"):
+            await self._songlist_meta(source, sl_id)
         try:
             items = await self._fetch_paged(
                 "/api/music/songList/detail",
@@ -2022,7 +3424,7 @@ class LxMusicProvider(MusicProvider):
                 max_items=1000,
             )
         except Exception as err:  # noqa: BLE001
-            LOGGER.debug("lxmusic: 广场歌单详情失败 %s/%s: %s", source, sl_id, err)
+            LOGGER.debug("lxmusic: square playlist detail failed %s/%s: %s", source, sl_id, err)
             return []
         out: list[Track] = []
         for item in items[start : start + page_size]:
@@ -2034,12 +3436,12 @@ class LxMusicProvider(MusicProvider):
         return out
 
     async def _get_user_lists(self) -> dict[str, Any] | None:
-        """拉取当前用户的歌单数据（defaultList/loveList/userList），带 TTL 缓存。
+        """Fetch the current user's playlists (recent, love, custom) with a TTL cache.
 
-        BUG #34 (2026-09-04) 修复: 之前缓存永久不过期,导致用户在 lxserver
-        端新建的歌单永远不会被 MA 发现。这里加 60s TTL,既能保证 sync 任务
-        能周期性看到新歌单,又不会让 search/get_playlist 等高频调用都打
-        lxserver。用 lock 防止并发触发时重复请求。
+        The cache must expire: without a TTL, playlists created on the lxserver
+        side were never discovered by MA. 60s lets the sync task pick up changes
+        without putting this on the hot path. A lock keeps concurrent callers
+        from issuing the same request.
         """
         now = asyncio.get_event_loop().time()
         if (
@@ -2048,7 +3450,7 @@ class LxMusicProvider(MusicProvider):
         ):
             return self._user_lists_cache
         async with self._user_lists_cache_lock:
-            # 双重检查,避免锁外等待的协程拿到旧缓存后重请求
+            # re-check inside the lock so waiters do not refetch after the winner did
             now = asyncio.get_event_loop().time()
             if (
                 self._user_lists_cache is not None
@@ -2058,20 +3460,21 @@ class LxMusicProvider(MusicProvider):
             try:
                 data = await self._request("GET", "/api/user/list")
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("获取用户歌单失败: %s", err)
-                # 失败时不更新缓存,让下次仍走缓存(如果之前缓存有效)
-                # 但也不清掉旧缓存,避免临时网络抖动导致全量丢失
+                LOGGER.debug("failed to fetch user playlists: %s", err)
+                # On failure keep the previous cache: do not refresh the
+                # timestamp, and do not drop a usable snapshot over a transient
+                # network error.
                 return self._user_lists_cache
             if isinstance(data, dict):
                 self._user_lists_cache = data
                 self._user_lists_cache_time = asyncio.get_event_loop().time()
                 LOGGER.debug(
-                    "lxmusic: _get_user_lists 刷新缓存 userList 数量=%d",
+                    "lxmusic: user list cache refreshed, userList entries=%d",
                     len(data.get("userList", []) or []),
                 )
             else:
                 LOGGER.debug(
-                    "lxmusic: /api/user/list 返回非 dict: %r", type(data).__name__,
+                    "lxmusic: /api/user/list returned %s instead of a dict", type(data).__name__,
                 )
             return self._user_lists_cache
 
@@ -2102,20 +3505,19 @@ class LxMusicProvider(MusicProvider):
 
         # --- leaderboards ---
         if "board" in kinds and getattr(self, "_import_leaderboards", True):
-            # BUG #94 (2026-09-07): 缓存守卫
-            # 4 源 boards + 161 个 pic 拉取总耗时 ~25s,用户点开榜单子文件夹
-            # 时 browse 触发 _collect_virtual_meta 又跑一遍,UI 上空白直到
-            # 超时,体感"读不出歌单"。第一次 fill 后把 pic 存到 _virtual_meta,
-            # 后续 browse 直接从 _virtual_meta 构造 out 返回,毫秒级响应。
+            # Cache guard. Filling boards and covers takes about 25s; without
+            # this, every browse click that reached this point re-fetched
+            # everything and the UI sat blank long enough to look broken.
+            # After the first fill the covers live in _virtual_meta and browse
+            # is served from there.
             cached_boards: list[tuple[str, dict[str, Any]]] = [
                 (iid, meta)
                 for iid, meta in self._virtual_meta.items()
                 if isinstance(meta, dict) and meta.get("kind") == "board"
             ]
             if cached_boards:
-                # BUG #96 (2026-09-07): 加 mg=4(咪咕)。
-                # LX 服务端实际支持 5 个 source,原代码只 4 个,
-                # 导致咪咕 10 个榜单完全没被拉取。
+                # All five sources the server supports must be listed here;
+                # omitting one silently leaves its boards out of the listing.
                 source_order = {"kg": 0, "kw": 1, "wy": 2, "tx": 3, "mg": 4}
 
                 def _is_hot_cached(name: str) -> bool:
@@ -2142,24 +3544,24 @@ class LxMusicProvider(MusicProvider):
                         "source": meta.get("source", ""),
                     })
                 LOGGER.debug(
-                    "lxmusic: 排行榜从缓存读 %d 条,跳过 4 源重拉",
+                    "lxmusic: leaderboards served from cache, %d entries, no refetch",
                     len(cached_boards),
                 )
             else:
-                # 缓存未命中:首次 fill 4 源 boards + pic。browse 子目录
-                # 在 _prefetch_leaderboards 后台任务完成后才会进这里,届时
-                # _virtual_meta 已有 board,直接走上面缓存分支。
+                # Cache miss: first fill of boards and covers. By the time a
+                # browse subfolder reaches this, the startup prefetch has
+                # normally populated _virtual_meta and the branch above applies.
                 await self._fill_leaderboards(out)
         elif "board" in kinds:
-            LOGGER.debug("lxmusic: 排行榜开关关闭,browse 入口不展示排行榜")
+            LOGGER.debug("lxmusic: leaderboard toggle off, browse entry hidden")
 
-        # --- square playlists (按 tag 各取 top N) ---
+        # --- square playlists (top N per tag) ---
         if "songlist" in kinds and getattr(self, "_import_square", True):
             per_tag = getattr(self, "_LEADERBOARD_TOPN", 5)
             try:
                 tags_resp = await self._request("GET", "/api/music/songList/tags")
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("lxmusic: 拉取歌单分类失败: %s", err)
+                LOGGER.debug("lxmusic: playlist categories failed: %s", err)
                 tags_resp = None
             if isinstance(tags_resp, dict):
                 seen_sl_ids: set[str] = set()
@@ -2184,7 +3586,7 @@ class LxMusicProvider(MusicProvider):
                             )
                         except Exception as err:  # noqa: BLE001
                             LOGGER.debug(
-                                "lxmusic: 拉取广场歌单列表失败 %s/%s: %s",
+                                "lxmusic: square playlist list failed %s/%s: %s",
                                 tag_src, tag_id, err,
                             )
                             continue
@@ -2243,14 +3645,14 @@ class LxMusicProvider(MusicProvider):
                     )
                     for r in results:
                         if isinstance(r, BaseException):
-                            LOGGER.debug("lxmusic: fetch sl detail pic 异常: %s", r)
+                            LOGGER.debug("lxmusic: square playlist cover lookup failed: %s", r)
                             continue
                         item_id, pic = r
                         if pic:
                             sl_pic_map[item_id] = pic
 
                 LOGGER.debug(
-                    "lxmusic: browse 准备展示 %d 个 LX 广场歌单 (拿到 %d 个封面)",
+                    "lxmusic: browse preparing %d LX square playlists (%d covers)",
                     len(sl_jobs), len(sl_pic_map),
                 )
                 for job in sl_jobs:
@@ -2265,28 +3667,25 @@ class LxMusicProvider(MusicProvider):
                         "tag_id": job["tag_id"],
                     })
         elif "songlist" in kinds:
-            LOGGER.debug("lxmusic: 广场歌单开关关闭,browse 入口不展示广场歌单")
+            LOGGER.debug("lxmusic: square toggle off, browse entry hidden")
 
         return out
 
     async def _fill_leaderboards(self, out: list[dict[str, str]]) -> None:
-        """首次 fill 4 源 LX 排行榜 boards + 封面,填进 out 与 _virtual_meta。
+        """Fill leaderboards and their covers into out and _virtual_meta on first use.
 
-        BUG #94 (2026-09-07) 修复:
-        - 原代码 `_collect_virtual_meta` 用 ``if/elif`` 但条件完全相同,
-          导致 elif 分支(首次 fill)永不执行,browse 永远拿不到榜单,
-          体感"读不出歌单"。这里把 fill 抽成独立 async 方法,挂在
-          cache 守卫的 else 分支下调用,逻辑才走得到。
-        - 用户要求去掉 source 中间层 BrowseFolder,161 个榜单平铺,
-          name 格式 ``[酷狗]/[酷我]/[网易]/[QQ] xxx``,本方法负责
-          写入这种展示名,供 browse `playlists/board` 一次返回。
+        Split out of _collect_virtual_meta so it is reachable from the cache-miss
+        branch; inlining it behind a duplicated condition left the fill
+        unreachable and browse returned no boards at all.
+
+        Boards are listed flat, without a per-platform folder, and named
+        "[platform] board" so that identically named boards from different
+        platforms stay distinguishable.
         """
         leaderboard_sources: tuple[str, ...] = ("kg", "kw", "wy", "tx", "mg")
-        # BUG #94 (2026-09-07): [kg]/[kw]/[wy]/[tx] → [酷狗]/[酷我]/[网易]/[QQ]
-        # BUG #96 (2026-09-07): LX 服务端实际支持 5 个 source(kg/kw/wy/tx/mg),
-        # MG 有 10 个榜单,原代码漏了 mg 导致咪咕榜单完全不显示。
-        # 排行榜前缀要短(用户要求),跟 SOURCE_NAMES 的"咪咕音乐"等
-        # 长名风格不同,这里单独维护一张短前缀表;新平台同步加两边。
+        # Short display prefixes for boards. These are deliberately shorter than
+        # the full names in SOURCE_NAMES, so they are kept in their own table;
+        # add new platforms to both.
         source_label: dict[str, str] = {
             "kg": "酷狗", "kw": "酷我", "wy": "网易", "tx": "QQ", "mg": "咪咕",
         }
@@ -2299,11 +3698,11 @@ class LxMusicProvider(MusicProvider):
                     params={"source": src},
                 )
             except Exception as err:  # noqa: BLE001
-                LOGGER.debug("lxmusic: 拉取 %s 排行榜分类失败: %s", src, err)
+                LOGGER.debug("lxmusic: leaderboard categories failed for %s: %s", src, err)
                 resp = None
             if isinstance(resp, dict):
                 boards_resp_map[src] = resp
-            # 错开请求,降低触发 LX 互斥锁的概率
+            # stagger requests to reduce the chance of hitting the server mutex
             await asyncio.sleep(0.3)
 
         all_jobs: list[dict[str, str]] = []
@@ -2324,29 +3723,28 @@ class LxMusicProvider(MusicProvider):
                     "source": src_actual,
                     "bangid": bangid,
                     "bname": bname,
-                    # BUG #94: [酷狗]/[酷我]/[网易]/[QQ] 中文前缀
+                    # localized platform prefix, see the table above
                     "name": f"[{src_zh}] {bname}",
                 })
 
         board_pic_map: dict[str, str] = {}
-        # BUG #97 (2026-09-07): 空榜单不导入
-        # 实测 LX 服务端部分榜单返回空 list 或 500(如 mg 欧美榜 19190036
-        # 500、tx 有声榜 75 返回 0 首),导入后用户点进去没歌曲。
-        # 直接发 /leaderboard/list?page=1 一次拿 list,既判断空/异常
-        # 又能取首首 pic——比之前 _fetch_first_pic 多 0 次请求。
-        skipped_empty: list[tuple[str, str]] = []  # (bangid, name) 供日志
+        # Skip boards that come back empty. Some boards return an empty list or
+        # HTTP 500 on the server, and importing them yields playlists the user
+        # then finds empty. Probing the first page once both detects that and
+        # supplies the cover, so it costs no extra requests.
+        skipped_empty: list[tuple[str, str]] = []  # (bangid, name), for logging
         skipped_keys: set[str] = set()
         if all_jobs:
-            # BUG #93: pic 拉取串行(Semaphore=1)。
-            # Semaphore=8 在 161 个榜单场景下会大量触发 LX 互斥锁,
-            # 拿到空 pic。串行慢一点但稳定,每个 pic ~150ms,
-            # 161 个 ~25s;browse 后台预 fill 后这个延迟对用户隐藏。
+            # Cover fetches run one at a time. A wider semaphore trips the server
+            # mutex at this scale and returns empty covers; serial is slower but
+            # reliable, roughly 150ms each and about 25s in total, and the
+            # startup prefetch keeps that cost out of the user's way.
             sem = asyncio.Semaphore(1)
 
             async def _probe_board(
                 job: dict[str, str],
             ) -> tuple[str, list[dict[str, Any]]]:
-                """返回 (key, items);items 为空 / 异常 → 跳过此榜单。"""
+                """Return (key, items); an empty or failed items list skips the board."""
                 key = f"{job['source']}:{job['bangid']}"
                 async with sem:
                     for retry in range(3):
@@ -2369,7 +3767,7 @@ class LxMusicProvider(MusicProvider):
                                 await asyncio.sleep(0.5 * (2 ** retry))
                             else:
                                 LOGGER.debug(
-                                    "lxmusic: probe %s list 3 次失败: %s",
+                                    "lxmusic: board probe %s failed after 3 tries: %s",
                                     key, err,
                                 )
                                 return (key, [])
@@ -2381,7 +3779,7 @@ class LxMusicProvider(MusicProvider):
             )
             for j, r in zip(all_jobs, results):
                 if isinstance(r, BaseException):
-                    LOGGER.debug("lxmusic: probe board 异常: %s", r)
+                    LOGGER.debug("lxmusic: board probe error: %s", r)
                     skipped_keys.add(f"{j['source']}:{j['bangid']}")
                     skipped_empty.append((j["bangid"], j["bname"]))
                     continue
@@ -2390,7 +3788,7 @@ class LxMusicProvider(MusicProvider):
                     skipped_keys.add(key)
                     skipped_empty.append((j["bangid"], j["bname"]))
                     continue
-                # 取首首 pic(优先 item.pic / al.picUrl)
+                # cover from the first track, preferring item.pic or al.picUrl
                 first = items[0]
                 if isinstance(first, dict):
                     pic = (
@@ -2402,16 +3800,16 @@ class LxMusicProvider(MusicProvider):
                     if pic:
                         board_pic_map[key] = pic
 
-        # 过滤掉空榜单
+        # drop boards that came back empty
         if skipped_empty:
             LOGGER.info(
-                "lxmusic: 跳过 %d 个空榜单 (服务器返回空 list 或 500): %s",
+                "lxmusic: skipped %d empty boards (empty list or 500): %s",
                 len(skipped_empty),
                 ", ".join(f"{bid}/{nm}" for bid, nm in skipped_empty[:5])
                 + ("..." if len(skipped_empty) > 5 else ""),
             )
         LOGGER.info(
-            "lxmusic: 首次 fill %d 个 LX 排行榜 (5 源, 拿到 %d 个封面, 跳过 %d 个空)",
+            "lxmusic: first fill of %d LX leaderboards (5 sources, %d covers, %d empty skipped)",
             len(all_jobs), len(board_pic_map), len(skipped_empty),
         )
         for job in all_jobs:
@@ -2419,7 +3817,7 @@ class LxMusicProvider(MusicProvider):
             src = job["source"]
             key = f"{src}:{bangid}"
             if key in skipped_keys:
-                # BUG #97 (2026-09-07): 空榜单 / 服务端 500,不导入。
+                # Empty board or a server error: do not import it.
                 continue
             item_id = f"list:board:{src}:{bangid}"
             self._playlist_cache.setdefault(item_id, [])
@@ -2439,27 +3837,24 @@ class LxMusicProvider(MusicProvider):
             })
 
     async def _fetch_first_pic(self, path: str, **params) -> str | None:
-        """拉取 LX API 列表的第一项封面 URL。
+        """Fetch the cover of the first entry of an lxserver list endpoint.
 
-        2026-09-04 Task #42 实现:用户要求"歌单用第一首歌封面做歌单封面"。
-        LX server 排行榜/广场歌单返回的顶层 ``img`` 字段常常是空字符串或缺失,
-        导致 sync 出来的虚拟歌单封面是空。在 sync 阶段并发拉每个榜单/歌单的第一页
-        第一首,把 ``pic`` 字段赋给 ``playlist.metadata.images``。
+        Leaderboards and square playlists often have an empty top-level image
+        field, which left synced virtual playlists without artwork. Fetching the
+        first page and taking the first track's cover fills that in.
 
-        用于:
-        - 用户歌单:实际不需要 helper(``_iter_user_playlists`` 已经把 songs 拉回来
-          了,直接 ``songs[0].get("pic")`` 即可),仅用于排行榜和广场歌单。
-        - 排行榜:``/api/music/leaderboard/list?source=X&bangid=Y&page=1``
-        - 广场歌单:``/api/music/songList/detail?source=X&id=Y`` (此处网易云某些
-          歌曲 ``al.picUrl`` 为空导致首歌曲 pic 不可用,调用方应 fallback 到歌单
-          自身封面 ``sl.get("img")``,见 ``get_library_playlists`` 广场歌单 yield 段)
+        Used for leaderboards (leaderboard/list) and square playlists
+        (songList/detail). User playlists do not need it, since their songs are
+        already in hand. When a track has no cover the caller should fall back
+        to the playlist's own image.
 
-        任一环节失败都返回 ``None``,由调用方决定是否赋值,不影响原 yield 流程。
+        Any failure returns None and leaves the decision to the caller, so the
+        surrounding yield flow is unaffected.
         """
         try:
             resp = await self._request("GET", path, params=params)
         except Exception as err:  # noqa: BLE001
-            LOGGER.debug("lxmusic: fetch_first_pic %s 失败: %s", path, err)
+            LOGGER.debug("lxmusic: fetch_first_pic %s failed: %s", path, err)
             return None
         if not isinstance(resp, dict):
             return None
@@ -2475,13 +3870,13 @@ class LxMusicProvider(MusicProvider):
     async def _get_square_tags_cached(
         self,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """获取 tags API 缓存,首次调用 fetch,后续复用。
+        """Fetch the square tag API once and reuse the result.
 
-        返回 (raw tags list, hotTag list)。
-        BUG #83 (2026-09-06): browse 顶层 + 子层共用这份缓存,避免重复请求。
-        BUG #88 (2026-09-06): LX /songList/list 不按 tag 过滤(无论传父 tag
-        还是 sub_tag 都返回 source 全量),所以丢弃 parent→sub 展开,改用
-        API 直接返回的 hotTag 字段(10 个)作为顶层热门分类。
+        Returns the raw tag list plus the hot tag list. Both the top level and
+        the sub level of browse share this cache to avoid repeat requests.
+        Since the server does not filter songList/list by tag, expanding parent
+        tags into sub-tags is pointless; the hotTag field the API returns is
+        used as the top-level categories instead.
         """
         cached = getattr(self, "_square_tags_cache", None)
         if cached is not None:
@@ -2497,30 +3892,30 @@ class LxMusicProvider(MusicProvider):
                     hot_tags.append(h)
         self._square_tags_cache = (raw, hot_tags)
         LOGGER.info(
-            "lxmusic: 缓存广场 tags API | 父 tag=%d 个, hotTag=%d 个",
+            "lxmusic: cached square tags | parent tags=%d hotTags=%d",
             len(raw), len(hot_tags),
         )
         return self._square_tags_cache
 
     async def _fetch_square_all_items(self) -> list[ItemMapping]:
-        """拉 LX /songList/list 全量,按歌曲数(total)降序,取 top 200。
+        """Fetch every square playlist, sort by track count and keep the top 200.
 
-        BUG #89 (2026-09-06): LX /songList/list 不按 tag 过滤,任何
-        父→子展开或 hotTag 切片切来切去都是同一份 source 全量(curl 验证
-        华语/流行 两次请求前 5 个 id 完全一致)→ 改单层 + 拉全量。
-        BUG #90 (2026-09-06): LX 服务端 /songList/list 真的分页,每页
-        固定 36 条,total=1752。只拉 page=1 给用户 36 条首页热门 →
-        必须翻页拉全量。
-        BUG #91 (2026-09-06 Part 3): 实测 LX 服务端对**并发请求做了互斥锁**,
-        asyncio.gather 并发 10 页时只有"最后一页"返回数据,其他 9 页全
-        空 list;并发 3 页时只有 page=3 返回数据。**必须顺序翻页**。
-        实现: page=1..N 顺序拉,每页 retry 3 次退避 0.5/1/2s,空 list 即
-        末尾停止;用第一页 total 估算 max_pages (兜底 50);跨页去重 + 按
-        total 降序 + top 200。
+        Three server behaviours shape this:
+        - songList/list ignores the tag argument, so any tag-based slicing
+          returns the same full set and a single flat fetch is the right shape
+        - the endpoint is genuinely paginated with a fixed page size, so one
+          page is only a fraction of the catalog
+        - the server serializes concurrent requests, so fetching pages in
+          parallel returns data for one page and empty lists for the rest
+
+        Hence pages are fetched sequentially, each retried a few times with
+        backoff, stopping at the first empty page. The page count is estimated
+        from the total reported on page 1, results are deduped across pages,
+        sorted by track count and truncated.
         """
-        page_size = 36  # LX 服务端硬编码每页 36,客户端 limit 被忽略
+        page_size = 36  # the server hardcodes 36 per page and ignores limit
 
-        # 第一页:拿 total + 起始 list
+        # first page: total plus the starting batch
         first_resp = await self._request(
             "GET",
             "/api/music/songList/list",
@@ -2538,15 +3933,15 @@ class LxMusicProvider(MusicProvider):
             except (TypeError, ValueError):
                 server_total = 0
 
-        # 根据 total 估算 max_pages (兜底 50)
+        # estimate the page count from the reported total, with a cap
         if server_total > 0:
             max_pages = min((server_total // page_size) + 2, 50)
         else:
-            max_pages = 50  # total 字段缺失,兜底
+            max_pages = 50  # the total field was missing, use a safe cap
 
         all_lists: list[dict[str, Any]] = list(first_lists)
 
-        # 顺序翻页 2..max_pages
+        # fetch the remaining pages sequentially
         for p in range(2, max_pages + 1):
             page_lists: list[dict[str, Any]] = []
             for retry in range(3):
@@ -2564,16 +3959,16 @@ class LxMusicProvider(MusicProvider):
                     break
                 except Exception as err:  # noqa: BLE001
                     LOGGER.debug(
-                        "lxmusic: 广场歌单 page=%d 重试 %d: %s",
+                        "lxmusic: square playlist page=%d retry %d: %s",
                         p, retry + 1, err,
                     )
                     await asyncio.sleep(0.5 * (2 ** retry))
             if not page_lists:
-                # 空 list(末尾 / 服务端到此为止) 或 3 次重试全失败 → 停止
+                # empty list means the end, or the retries failed: stop here
                 break
             all_lists.extend(page_lists)
 
-        # 全局去重 + 构建 ItemMapping (跨页去重,LX 偶尔可能跨页重复)
+        # dedupe across pages and build ItemMappings; pages can overlap
         out: list[ItemMapping] = []
         seen: set[str] = set()
         for sl in all_lists:
@@ -2623,13 +4018,13 @@ class LxMusicProvider(MusicProvider):
                     image=sl_image,
                 )
             )
-        # 按 total 降序 + 取 top 200
+        # sort by track count and keep the top slice
         out.sort(
             key=lambda im: self._square_meta.get(im.item_id, {}).get("total", 0),
             reverse=True,
         )
         LOGGER.info(
-            "lxmusic: 广场歌单 | 翻页拉到 %d 条 (跨页去重后), top %d, server_total=%d",
+            "lxmusic: square playlists | %d fetched after dedup, top %d, server_total=%d",
             len(out), min(200, len(out)), server_total,
         )
         return out[:200]
@@ -2639,15 +4034,16 @@ class LxMusicProvider(MusicProvider):
         sub_tid: str,
         tag_name: str = "",
     ) -> list[ItemMapping]:
-        """拉取单个 sub_tag 的歌单列表 (去重 + 缓存 _square_meta + ItemMapping.image)。
+        """Fetch playlists for one sub tag, deduped, cached and with covers.
 
-        BUG #83: browse `playlists/square/{id}` 子层 helper。
-        BUG #88 (2026-09-06): LX /songList/list 不按 tag 过滤,所有 sub_tag
-        返回相同内容。给 ItemMapping.name 加 [tag_name] 前缀,让用户能看出
-        这份歌单是从哪个 hotTag 子层点开的(避免切换分类时看到一模一样
-        的名字误以为是 bug)。tag_name 为空时不加前缀。
-        BUG #89 (2026-09-06): 当前已不被调用(LX 不按 tag 过滤的硬约束),
-        保留函数定义供后续扩展/回滚,顶层 browse 改走 _fetch_square_all_items。
+        Kept for the browse square/{id} sub level. Because the server does not
+        filter by tag, every sub tag returns the same content, so the display
+        name carries a [tag] prefix to make it obvious which category a listing
+        came from instead of looking like a stuck view. The cached name stays
+        unmodified.
+
+        Currently unused for the same reason; the top level browse path uses
+        _fetch_square_all_items. Retained as an extension point.
         """
         lists: list[dict[str, Any]] = []
         for param_name in ("tag", "id"):
@@ -2676,9 +4072,10 @@ class LxMusicProvider(MusicProvider):
             sl_name = sl.get("name") or sl.get("listName") or sl_id
             sl_source = sl.get("source") or self._default_source
             sl_item_id = f"sl:{sl_source}:{sl_id}"
-            # BUG #88 (2026-09-06): 给展示名加 [hotTag] 前缀 (用 | 分隔避免和
-            # 歌单自身名字里可能含的 [ ] 冲突);缓存里仍存原始名,_get_playlist
-            # 拿到真实数据后会覆盖 _square_meta.name,不影响下游。
+            # Prefix the display name with the hot tag, separated by | so it
+            # cannot collide with brackets in a playlist's own name. The cache
+            # keeps the original name, which get_playlist overwrites with real
+            # data anyway.
             display_name = f"[{tag_name}] {sl_name}" if tag_name else sl_name
             self._square_meta[sl_item_id] = {
                 "source": sl_source,
@@ -2718,29 +4115,28 @@ class LxMusicProvider(MusicProvider):
     def _iter_user_playlists(
         data: dict[str, Any]
     ) -> list[tuple[str, str, list[dict[str, Any]]]]:
-        """遍历用户歌单，返回 (id, name, songs) 三元组列表。
+        """Iterate user playlists, returning (id, name, songs) triples.
 
-        BUG #34 (2026-09-04) 修复: lxserver 实际返回结构里:
-        - defaultList / loveList 是「歌曲 list」(顶格就是 LX.Music.MusicInfo 数组),
-          不是嵌套 {id,name,list} 的 dict。原代码用 ``isinstance(lst, dict)`` 判断,
-          永远跳过,导致"我最近播放 / 我收藏 (lxserver 约定名;MA 显示为'洛雪收藏')"两个内置歌单从未同步进 MA。
-        - userList 是「歌单 list」,每项是 {id, name, list:[歌曲...]} 的歌单 dict。
-          原代码对 userList 处理是对的,但 defaultList/loveList 一直没暴露。
-        这里把 defaultList / loveList 各自打包成一个虚拟歌单(用 __default__ /
-        __love__ 当 item_id,MA 不会和真实歌单冲突)。
+        The server's shape differs per section: defaultList and loveList are
+        bare song arrays rather than {id, name, list} objects, so they have to
+        be wrapped as virtual playlists with synthetic ids that cannot collide
+        with real ones. userList entries are proper playlist objects.
+
+        Treating the first two as objects, as an earlier version did, silently
+        dropped them and the recent-play and love playlists never reached MA.
         """
         out: list[tuple[str, str, list[dict[str, Any]]]] = []
-        # defaultList = "我最近播放", loveList = "我收藏"(lxserver 约定) —— MA 显示名 "洛雪收藏"
+        # defaultList is the recent-play list and loveList the love list; MA shows the latter as a favorites playlist
         for key, virtual_id, virtual_name in (
             ("defaultList", "__default__", "我最近播放"),
             ("loveList", "__love__", "洛雪收藏"),
         ):
             lst = data.get(key)
             if isinstance(lst, list):
-                # 顶层就是歌曲数组,直接当虚拟歌单用
+                # a bare song array, wrap it as a virtual playlist
                 out.append((virtual_id, virtual_name, lst))
             elif isinstance(lst, dict):
-                # 旧版/兼容: 部分 lxserver 版本可能仍嵌套 {id,name,list}
+                # older servers may still nest {id, name, list}
                 out.append(
                     (lst.get("id", key), lst.get("name", virtual_name), lst.get("list", []))
                 )
@@ -2748,7 +4144,7 @@ class LxMusicProvider(MusicProvider):
             if isinstance(lst, dict):
                 pl_id = lst.get("id")
                 if not pl_id:
-                    # 没有 id 的歌单跳过,避免与虚拟歌单冲突
+                    # skip entries without an id so they cannot clash with the virtual ones
                     continue
                 out.append(
                     (
@@ -2780,19 +4176,19 @@ class LxMusicProvider(MusicProvider):
     def _pick_content_type(
         result: Any, url: str, quality: str,
     ) -> Any:
-        """双重保险识别 lxserver 实际返回的音频 content_type。
+        """Determine the audio content type lxserver actually returned.
 
-        BUG #44 (2026-09-05): 之前硬编码 ContentType.MP3,在用户 lxserver 端开启
-        "最高音质"时,实际 URL 是 flac,导致 amcfy 桥接给 APP 发 audio/mpeg,
-        APP 用 mp3 解码器解 flac 字节流 → 听到糊/破音。
+        Hardcoding MP3 was wrong: with the server set to highest quality the URL
+        is often flac, and labeling those bytes audio/mpeg makes clients decode
+        flac with an mp3 decoder, which sounds distorted.
 
-        识别优先级:
-        1) lxserver 响应里的 type/quality 字段(lxserver 通常在 result.data.type
-           或 result.type 返回 "flac"/"320k"/"128k")
-        2) URL 后缀兜底(.flac/.mp3/.m4a/.ogg/.opus)
-        3) 都没识别到才 fallback 到 MP3(对 128k/320k 默认就是 MP3)
+        In order:
+        1) the type/quality field in the server response, usually under
+           result.data.type or result.type, holding flac/320k/128k
+        2) the URL suffix, such as .flac, .mp3, .m4a, .ogg or .opus
+        3) MP3 as the default, which is correct for the 128k and 320k tiers
         """
-        # 第一保险: lxserver 响应里的 type 字段
+        # first: the type field in the server response
         type_hint = ""
         if isinstance(result, dict):
             for container in (result, result.get("data") if isinstance(result.get("data"), dict) else {}):
@@ -2814,7 +4210,7 @@ class LxMusicProvider(MusicProvider):
         if type_hint == "opus":
             return ContentType.OPUS
 
-        # 第二保险: URL 后缀
+        # second: the URL suffix
         u = (url or "").lower().split("?", 1)[0]
         if u.endswith(".flac"):
             return ContentType.FLAC
@@ -2829,23 +4225,23 @@ class LxMusicProvider(MusicProvider):
         if u.endswith(".mp3"):
             return ContentType.MP3
 
-        # 终极 fallback
+        # final default
         return ContentType.MP3
 
     @staticmethod
     def _infer_metadata_content_type(item: dict[str, Any], source: str) -> Any:
-        """按 lxserver item 里可用的字段,推断 ProviderMapping 应该宣告的 content_type。
+        """Infer the content type to advertise from the fields an item provides.
 
-        BUG #44 (2026-09-05): 之前所有 ProviderMapping 都被硬编码 MP3,导致 amcfy
-        桥接永远发 audio/mpeg。看 item 里是否有 type/quality/url/试听链接后缀。
-
-        - item.type == "flac"/"320k"/"128k": 直接用
-        - item.types 数组 (lxserver 部分版本): 选最高优先级含 flac 的
-        - item 中 meta / _quality / quality 字段
-        - lxserver 试听预览 URL 后缀
-        - 都没: 按平台默认(优先 FLAC,因为"最高音质"设置下多数平台会优先返回 flac)
+        Advertising MP3 for everything made the bridge always send audio/mpeg.
+        Look at what the item actually carries:
+        - a single type field with flac/320k/128k: use it
+        - a types array, present on some server versions: prefer flac
+        - a quality field, possibly nested in meta
+        - the suffix of a preview URL in the item
+        - none of the above: the platform default, preferring flac since
+          highest-quality settings usually return it
         """
-        # 1) 单值 type
+        # 1) single type value
         t = item.get("type")
         if isinstance(t, str) and t:
             tl = t.lower()
@@ -2860,11 +4256,11 @@ class LxMusicProvider(MusicProvider):
             if "opus" in tl:
                 return ContentType.OPUS
 
-        # 2) 多音质数组
+        # 2) list of available qualities
         for key in ("types", "qualities", "_quality", "qualityList"):
             arr = item.get(key)
             if isinstance(arr, list) and arr:
-                # 优先找含 flac 的
+                # prefer flac when offered
                 for q in arr:
                     if isinstance(q, str) and "flac" in q.lower():
                         return ContentType.FLAC
@@ -2873,7 +4269,7 @@ class LxMusicProvider(MusicProvider):
                         return ContentType.MP3
                 break
 
-        # 3) 单个 quality 字段
+        # 3) a lone quality field
         q = item.get("quality") or item.get("_quality")
         if isinstance(q, str) and q:
             ql = q.lower()
@@ -2884,7 +4280,7 @@ class LxMusicProvider(MusicProvider):
             if "m4a" in ql or "aac" in ql:
                 return ContentType.M4A
 
-        # 4) 试听/预览 URL 后缀
+        # 4) preview URL suffix
         for key in ("previewUrl", "preview_url", "trialUrl", "_preview"):
             val = item.get(key)
             if isinstance(val, str) and val:
@@ -2903,7 +4299,7 @@ class LxMusicProvider(MusicProvider):
                     return ContentType.MP3
                 break
 
-        # 5) 按平台默认最高音质推断(用户服务端"最高音质"设置,平台支持 flac 就标 flac)
+        # 5) infer the platform default, preferring flac when the server is set to highest quality
         source_default_flac = {
             "kw", "kg", "tx", "wy", "qq", "netease", "163", "mg",
         }
@@ -2927,16 +4323,15 @@ class LxMusicProvider(MusicProvider):
         if isinstance(duration, str):
             duration = self._parse_duration(duration)
 
-        # BUG #36 (2026-09-04) 修复: lxserver 对 songid 带前缀 (wy_xxxxx) 与
-        # 纯数字 (xxxxx) 走完全不同的解析路径——
-        # - wy_1973665667 → 走用户配置的自定义源 (如 metingapi 网关,可能挂)
-        # - 1973665667 → 走网易官方源 (m701.music.126.net 直链,稳)
-        # 搜索 hit 自带 songmid 字段且是纯数字,所以播放正常;
-        # 自建歌单歌曲的 id 是 wy_1973665667,卡在 metingapi。
-        # 这里把"剥前缀纯数字版"作为 songmid 写到 raw_cache 的副本,下游
-        # get_stream_details 拿到 raw 时直接用,无需关心 ID 格式。
-        # 注意: track.item_id 仍用原带前缀 ID (避免改了 MA 已收藏的 item_id),
-        # 关键修改只在 raw_cache 的副本上。
+        # The server resolves prefixed and bare ids through different paths: a
+        # prefixed id goes through the configured custom source, which may be
+        # down, while a bare numeric id uses the platform's official endpoint.
+        # Search hits already carry a numeric songmid and play fine, but songs in
+        # user playlists have prefixed ids and stall on the custom source.
+        # So store a copy in the raw cache with the prefix stripped as songmid,
+        # which lets get_stream_details use it without caring about id format.
+        # The track's own item_id keeps the original prefixed form so existing
+        # library entries are unaffected; only the cached copy changes.
         prefix = f"{source}_"
         if (
             song_id.startswith(prefix)
@@ -2946,7 +4341,7 @@ class LxMusicProvider(MusicProvider):
             raw_for_cache: dict[str, Any] = dict(item)
             raw_for_cache["songmid"] = song_id[len(prefix):]
             LOGGER.debug(
-                "lxmusic: 剥前缀给 raw 补 songmid=%s (item.id=%s)",
+                "lxmusic: stripped songmid=%s added to raw (item.id=%s)",
                 raw_for_cache["songmid"], song_id,
             )
         else:
@@ -2958,7 +4353,7 @@ class LxMusicProvider(MusicProvider):
             if album_real_id
             else self._artist_item_id(source, album_name)
         )
-        # 注册到缓存，供 get_artist / get_album / 歌手页回查
+        # register artist/album metadata so detail lookups can resolve them later
         self._artist_cache.setdefault(
             artist_aid,
             {"source": source, "name": artist_name, "real_id": artist_real_id},
@@ -2992,13 +4387,12 @@ class LxMusicProvider(MusicProvider):
                     item_id=f"{source}:{song_id}",
                     provider_domain=self.domain,
                     provider_instance=self.instance_id,
-                    # BUG #44 (2026-09-05): ProviderMapping.audio_format 也曾硬编码 MP3,
-                    # 导致 amcfy 桥接用 mp3.content_type 推 Content-Type=audio/mpeg,
-                    # 但 stream_details.path 可能是 .flac,APP 拿 mp3 解码器解 flac 字节流
-                    # 会听起来糊。这里按 lxserver item 里能识别的字段推断 quality,
-                    # 拿不到就保守默认 FLAC(lxserver 端"最高音质"设置下多数平台优先 flac,
-                    # 拿不到 flac 时 get_stream_details 实际 URL 后缀会兜底)。这样 amcfy
-                    # 的 _guess_content_type 通过 af.output_format_str(含 "flac")会发 audio/flac。
+                    # audio_format must not be hardcoded either: the bridge derives
+                    # the response Content-Type from it, and labeling flac bytes as
+                    # mp3 makes clients decode them with the wrong decoder. Infer
+                    # the quality from the item, defaulting to FLAC, since with
+                    # highest quality most platforms return flac and the actual URL
+                    # suffix is checked later as a backstop.
                     audio_format=AudioFormat(
                         content_type=self._infer_metadata_content_type(item, source),
                     ),
@@ -3006,7 +4400,7 @@ class LxMusicProvider(MusicProvider):
                 )
             },
         )
-        # 归入其专辑缓存，点击专辑时直接复用（最可靠的专辑曲目来源）
+        # file under its album so opening that album reuses already parsed tracks
         self._album_tracks.setdefault(album_aid, [])
         if track.item_id not in {t.item_id for t in self._album_tracks[album_aid]}:
             self._album_tracks[album_aid].append(track)
@@ -3021,7 +4415,7 @@ class LxMusicProvider(MusicProvider):
                     remotely_accessible=True,
                 )
             ]
-        # 缓存 Track 与原始 item，供 get_track / get_stream_details 复用
+        # cache the Track and its raw item for get_track / get_stream_details
         if hasattr(self, "_track_cache"):
             self._track_cache[track.item_id] = track
         if hasattr(self, "_raw_cache"):
@@ -3029,17 +4423,17 @@ class LxMusicProvider(MusicProvider):
         return track
 
     # ------------------------------------------------------------------ #
-    # BUG #100 (2026-09-07): 歌词 — lxserver /api/music/lyric
-    # BUG #102 (2026-09-07): 改用 GET 端点
+    # Lyrics, via the lxserver lyric endpoint
     # ------------------------------------------------------------------ #
     async def _maybe_fetch_lyrics(
         self, track: Track, raw: dict[str, Any] | None = None
     ) -> None:
-        """BUG #100/#102: 拉歌词注入 track.metadata.lrc_lyrics。
+        """Fetch lyrics and attach them to the track.
 
-        - 已有 lyric 跳过 (兜底, 理论上 _parse_track 不会预填)
-        - _lyrics_cache 命中直接用 (含 None 缓存, 避免重复拉空)
-        - 拉取失败 / 没歌词 静默 (DEBUG 日志), 不抛, 不影响 get_track
+        - skip tracks that already have lyrics
+        - use the lyric cache when it has an entry, including a cached None
+        - failures and missing lyrics are silent apart from a debug log, so
+          get_track never fails over lyrics
         """
         if track.metadata and track.metadata.lrc_lyrics:
             return
@@ -3049,26 +4443,26 @@ class LxMusicProvider(MusicProvider):
             if cached_lrc:
                 self._set_track_lrc(track, cached_lrc)
             return
-        # 缓存未命中 → 调 lxserver
+        # cache miss: ask the server
         raw_item = raw if raw is not None else self._raw_cache.get(cache_key)
         try:
             lrc = await self._fetch_lyrics(cache_key, raw=raw_item)
         except Exception as err:  # noqa: BLE001
-            LOGGER.debug("lxmusic: 拉歌词异常 track=%s err=%s", cache_key, err)
+            LOGGER.debug("lxmusic: lyric fetch error track=%s err=%s", cache_key, err)
             lrc = None
         if not hasattr(self, "_lyrics_cache"):
             self._lyrics_cache = {}
-        # 成功 + 失败都缓存 (失败缓存 None, 避免反复打 lxserver)
+        # cache both hits and misses, so a track without lyrics is not refetched
         self._lyrics_cache[cache_key] = lrc
         if lrc:
             self._set_track_lrc(track, lrc)
 
     @staticmethod
     def _set_track_lrc(track: Track, lrc: str) -> None:
-        """把 lrc 文本塞到 track.metadata.lyrics + lrc_lyrics。
+        """Attach lrc text to the track metadata.
 
-        MA lyric controller 第一路径读 metadata.lyrics / metadata.lrc_lyrics,
-        都填保证两端都能渲染。 lyrics 字段由 normalize_lrc_lyrics 处理。
+        The MA lyric controller reads these fields first, so filling both keeps
+        every client able to render them. The lyrics field is normalized.
         """
         if not track.metadata:
             track.metadata = MediaItemMetadata()
@@ -3081,29 +4475,23 @@ class LxMusicProvider(MusicProvider):
         *,
         raw: dict[str, Any] | None = None,
     ) -> str | None:
-        """BUG #100/#102: 调 lxserver GET /api/music/lyric 拿歌词。
+        """Fetch lyrics from the lxserver GET lyric endpoint.
 
-        返回 lrc 文本 (含 [mm:ss.xx] 时间戳), 没歌词 / 失败 → 返回 None。
+        Returns lrc text with timestamps, or None when there are none or the
+        call failed.
 
-        BUG #102 (2026-09-07): 改用 GET 而非 POST。
-        原因: lxserver POST handler (server.js:5029-5031) 写法是
-          `const result = await musicSdk[source].getLyric(songInfo)`
-        但 musicSdk.getLyric 返回 requestObj { isCancelled, promise, ... },
-        不是 Promise, 所以 await 等于立即返回 requestObj 本身。
-        JSON.stringify(requestObj) → {"isCancelled":false,"promise":{}}
-        (Promise 实例被 JSON 序列化为 {}),promise.id 永远为空,
-        SSE 轮询永远拿不到 lyric。
+        GET rather than POST: the POST handler awaits the value returned by
+        musicSdk.getLyric, which is a wrapper object holding the real promise
+        rather than a promise itself. Awaiting it returns the wrapper, JSON
+        serializes its promise field to {}, and the result never carries lyrics.
+        The GET handler awaits the inner promise and answers with the lyric
+        object, so it works.
 
-        GET handler (server.js:4014-4019) 写法正确:
-          `const lyricInfo = await requestObj.promise`
-          `res.end(JSON.stringify(lyricInfo))`
-        等 promise resolve 再返回歌词对象。
-
-        各源额外需要的 query 字段 (server.js:3996-4009):
-        - wy: songmid, name, singer, interval (interval 是 "MM:SS" 字符串)
+        Extra query fields some sources need:
+        - wy: songmid, name, singer, interval (interval as "MM:SS")
         - kg: songmid, name, hash, interval ("MM:SS")
-        - mg: songmid, copyrightId, lrcUrl, mrcUrl, trcUrl (没有就先不传)
-        - tx/kw: songmid (interval 选填)
+        - mg: songmid, copyrightId, lrcUrl, mrcUrl, trcUrl, sent when present
+        - tx/kw: songmid, interval optional
         """
         source, song_id = self._split_id(prov_track_id)
         raw_item = raw or {}
@@ -3116,9 +4504,8 @@ class LxMusicProvider(MusicProvider):
         )
         hash_val = (raw_item.get("hash") or "") if raw_item else ""
 
-        # interval 必须是 "MM:SS" 字符串。lxserver 多数 SDK 都按字符串 split。
-        # raw_item.interval 已经就是 "MM:SS" 格式 (lxserver 搜索结果格式);
-        # 如果是纯秒数 (数字 / "234"), 转成 "03:54"。
+        # interval must be a "MM:SS" string, since the source SDKs split it as
+        # text. Search results already provide that form; convert bare seconds.
         interval_str = _normalize_lx_interval(interval_raw)
 
         params: dict[str, Any] = {
@@ -3141,31 +4528,30 @@ class LxMusicProvider(MusicProvider):
             )
         except Exception as err:  # noqa: BLE001
             LOGGER.debug(
-                "lxmusic: lyric GET 异常 track=%s params=%s err=%s",
+                "lxmusic: lyric GET error track=%s params=%s err=%s",
                 prov_track_id, params, err,
             )
             return None
 
         if not isinstance(resp, dict):
             LOGGER.debug(
-                "lxmusic: lyric 响应非 dict track=%s type=%s",
+                "lxmusic: lyric response not a dict track=%s type=%s",
                 prov_track_id, type(resp).__name__,
             )
             return None
 
-        # lxserver GET 直接返回 { lyric, tlyric?, ... } 或纯文本 body
+        # the endpoint returns {lyric, tlyric, ...} or a plain text body
         return self._extract_lrc_from_payload(resp, source, song_id)
 
     @staticmethod
     def _extract_lrc_from_payload(
         payload: dict[str, Any], source: str, song_id: str
     ) -> str | None:
-        """从 lxserver lyric 响应 payload 抽 lrc 文本。
+        """Pull lrc text out of a lyric response payload.
 
-        兼容字段差异 (5 源字段可能不同):
-        - data.lyric / data.lrc / data.lyrics (数据嵌套)
-        - lyric / lrc / lyrics (扁平)
-        纯文本含 [mm:ss.xx] 时间戳视为 lrc 格式。
+        Field names vary by source, so accept data.lyric, data.lrc, data.lyrics,
+        or the same names un-nested. Plain text containing timestamps is taken
+        as lrc.
         """
         data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
         lrc_raw = (
@@ -3176,23 +4562,23 @@ class LxMusicProvider(MusicProvider):
         )
         if not isinstance(lrc_raw, str) or not lrc_raw.strip():
             LOGGER.debug(
-                "lxmusic: lyric 端点无可用文本 source=%s songmid=%s payload=%s",
+                "lxmusic: lyric endpoint returned no text source=%s songmid=%s payload=%s",
                 source, song_id,
                 str(payload)[:400] if isinstance(payload, dict) else payload,
             )
             return None
         LOGGER.debug(
-            "lxmusic: 拉歌词成功 source=%s songmid=%s lrc_len=%d",
+            "lxmusic: lyric fetched source=%s songmid=%s lrc_len=%d",
             source, song_id, len(lrc_raw),
         )
         return lrc_raw
 
     @staticmethod
     def _extract_singer_for_lyric(item: dict[str, Any]) -> str:
-        """从 raw MusicInfo 抽 singer 字符串。
+        """Extract a singer string from a raw MusicInfo.
 
-        与 _enrich_playlist_pics._extract_singer 同源逻辑 (list / str / dict 兼容),
-        但抽成独立 static method 避免耦合。
+        Same normalization as the cover backfill, which accepts a list, a string
+        or a dict, but kept separate so the two do not become coupled.
         """
         singer_raw = item.get("singer") or ""
         if isinstance(singer_raw, list):
@@ -3206,19 +4592,17 @@ class LxMusicProvider(MusicProvider):
         return ""
 
     async def _enrich_playlist_pics(self, items: list[dict[str, Any]]) -> None:
-        """补全用户歌单歌曲的封面 + 专辑信息 (就地修改 items)。
+        """Backfill covers and album info for user playlist tracks, in place.
 
-        lxserver 的 /api/user/list 返回的 LX.Music.MusicInfo 没有 img/pic/image/cover
-        /albumName/albumId 字段,而广场歌单 / 搜索结果都有 —— 这导致用户自己
-        创建/收藏的歌单歌曲在 MA 上没封面且显示"未知专辑"。解决办法: 用
-        name + singer 调 /api/music/search 重搜,取时长匹配 (±5s, 避免 BUG #35
-        同名翻唱/remix 错匹配) 的第一条 hit,写回 pic/albumName/albumId。
+        The user list endpoint returns no cover or album fields, unlike search
+        results and square playlists, so tracks in the user's own playlists
+        showed without artwork and under an unknown album. Re-searching by name
+        and artist recovers them; the first hit whose duration is within a few
+        seconds is taken, since same-name matches are often covers or remixes.
 
-        用 _pic_enrich_cache 缓存 (source, name, singer, interval) -> (pic,
-        album_name, album_id) 避免重复搜。并发 5 个搜索避免串行太慢。
-
-        2026-09-04 BUG #37 扩展: 同时补专辑 (albumName/albumId), 解决用户自建
-        歌单歌曲显示"未知专辑"。
+        Results are cached per source, name, singer and interval to avoid repeat
+        searches, and a handful of searches run concurrently rather than
+        serially.
         """
         if not items:
             return
@@ -3246,7 +4630,7 @@ class LxMusicProvider(MusicProvider):
             need_album = not (item.get("albumName") or item.get("album")) or not self._album_id(item)
             if not need_pic and not need_album:
                 return
-            # 原始 interval (用于时长校验, 避免同名翻唱)
+            # original duration, used to reject same-name covers
             item_interval = item.get("interval") or item.get("duration") or item.get("time") or ""
             expected_seconds = (
                 item_interval if isinstance(item_interval, int) else self._parse_duration(str(item_interval))
@@ -3268,7 +4652,7 @@ class LxMusicProvider(MusicProvider):
                     hits = await self._search_source(src, keyword, page=1, page_size=10)
                 except Exception as err:  # noqa: BLE001
                     LOGGER.debug(
-                        "lxmusic: 用户歌单歌曲补元数据失败 %s/%s/%s: %s",
+                        "lxmusic: user playlist metadata backfill failed %s/%s/%s: %s",
                         src, name, singer_key, err,
                     )
                     self._pic_enrich_cache[cache_key] = None
@@ -3276,7 +4660,7 @@ class LxMusicProvider(MusicProvider):
                 picked_pic: str | None = None
                 picked_album_name: str | None = None
                 picked_album_id: str | None = None
-                fallback_pic: str | None = None  # 时长不匹配但有 pic 的兜底
+                fallback_pic: str | None = None  # cover to use if no duration matches
                 for hit in hits:
                     pic = (
                         hit.get("img")
@@ -3292,7 +4676,7 @@ class LxMusicProvider(MusicProvider):
                     )
                     if not pic and not aname:
                         continue
-                    # 时长校验
+                    # duration check
                     hit_interval = hit.get("interval") or hit.get("duration") or ""
                     hit_seconds = self._parse_duration(str(hit_interval)) if hit_interval else 0
                     interval_ok = (
@@ -3309,10 +4693,10 @@ class LxMusicProvider(MusicProvider):
                         if picked_pic and picked_album_name:
                             break
                     else:
-                        # 时长不符但 pic 在,留作封面兜底
+                        # duration differs but the cover is usable as a fallback
                         if not fallback_pic and pic:
                             fallback_pic = pic
-                # 写入 item (in-place)
+                # write back in place
                 if need_pic:
                     final_pic = picked_pic or fallback_pic
                     if final_pic:
@@ -3321,7 +4705,7 @@ class LxMusicProvider(MusicProvider):
                     item["albumName"] = picked_album_name
                     if picked_album_id:
                         item["albumId"] = picked_album_id
-                # 缓存: 即使没补全也缓存 None, 避免每次都重搜
+                # cache None on a miss too, so it is not re-searched every time
                 if picked_pic or picked_album_name or fallback_pic:
                     self._pic_enrich_cache[cache_key] = {
                         "pic": picked_pic or fallback_pic,
@@ -3332,7 +4716,7 @@ class LxMusicProvider(MusicProvider):
                     self._pic_enrich_cache[cache_key] = None
                 if picked_pic or picked_album_name:
                     LOGGER.debug(
-                        "lxmusic: 用户歌单歌曲补元数据 %s/%s/%s -> pic=%s album=%s/%s",
+                        "lxmusic: user playlist metadata backfill %s/%s/%s -> pic=%s album=%s/%s",
                         src, name, singer_key,
                         bool(item.get("pic")), item.get("albumName"), item.get("albumId"),
                     )
@@ -3346,22 +4730,18 @@ class LxMusicProvider(MusicProvider):
         singer: str,
         expected_interval: str | int | None = None,
     ) -> str | None:
-        """跨平台重搜获取该平台的 songmid。
+        """Resolve a track's songmid on another platform by re-searching.
 
-        lxserver 的 /api/music/url 只走同源自定义源（如 wy 平台 → meting/ikun），
-        不跨平台 fallback。当 wy 平台的自定义源（如 metingapi 网关）失效时，
-        lxmusic 客户端必须自行跨平台重搜，拿到 kw/kg/tx/mg 平台的真实 songmid，
-        再调用 /api/music/url 用对应平台获取播放链接。
+        The playback endpoint only uses custom sources within one platform and
+        does not fall back across platforms, so when a platform's custom source
+        is down the client has to find the real songmid elsewhere.
 
-        BUG #35 (2026-09-04) 修复: 之前直接取第一条搜索 hit 当成"同一首歌",
-        实际上 kw/kg/tx/mg 平台搜 "海屿你 马也_Crabbit" 可能返回:
-        - 同名翻唱版本
-        - 同名不同专辑的 remix
-        - 同名其他歌手的歌曲
-        这些都让 MA 播放"错曲"。这里加 expected_interval 入参,要求搜索 hit 的
-        interval 与原歌单歌曲差异在 ±5s 内才算同一首,否则丢弃。
+        Taking the first search hit is not good enough: the same name often
+        matches a cover, a remix from another album, or a different artist, all
+        of which play the wrong recording. When the original duration is known,
+        a hit must be within a few seconds of it or it is discarded.
 
-        用 (src, name, singer, interval) 缓存避免重复搜。
+        Results are cached per source, name, singer and interval.
         """
         cache_key = (src, name, singer, expected_interval or "")
         if cache_key in self._songmid_resolve_cache:
@@ -3369,7 +4749,7 @@ class LxMusicProvider(MusicProvider):
         if not name:
             self._songmid_resolve_cache[cache_key] = None
             return None
-        # 把 expected_interval 转成秒,用于校验命中
+        # normalize the expected duration to seconds for comparison
         expected_seconds: int = 0
         if expected_interval:
             if isinstance(expected_interval, int):
@@ -3381,7 +4761,7 @@ class LxMusicProvider(MusicProvider):
             hits = await self._search_source(src, keyword, page=1, page_size=10)
         except Exception as err:  # noqa: BLE001
             LOGGER.debug(
-                "lxmusic: 跨平台重搜失败 %s/%s/%s: %s", src, name, singer, err,
+                "lxmusic: cross-platform re-search failed %s/%s/%s: %s", src, name, singer, err,
             )
             self._songmid_resolve_cache[cache_key] = None
             return None
@@ -3389,56 +4769,55 @@ class LxMusicProvider(MusicProvider):
             mid = self._item_song_id(hit)
             if not mid:
                 continue
-            # 时长校验: 如果原歌单歌曲有时长,要求搜索 hit 时长差异 ≤5s
+            # duration check: require a close match when the original is known
             if expected_seconds > 0:
                 hit_seconds = self._parse_duration(str(hit.get("interval", "")))
                 if hit_seconds <= 0:
-                    # 搜索 hit 没时长字段,无法校验,跳过避免错曲
+                    # the hit has no duration to compare, skip rather than risk it
                     continue
                 if abs(hit_seconds - expected_seconds) > 5:
                     LOGGER.debug(
-                        "lxmusic: 跨平台重搜 %s 命中 %s/%s 时长不符 (原=%ds, hit=%ds),跳过",
+                        "lxmusic: cross-platform hit %s %s/%s duration mismatch (original=%ds hit=%ds), skipped",
                         src, hit.get("name"), hit.get("singer"),
                         expected_seconds, hit_seconds,
                     )
                     continue
             self._songmid_resolve_cache[cache_key] = mid
             LOGGER.debug(
-                "lxmusic: 跨平台重搜 %s/%s/%s -> songmid=%s (时长校验通过)",
+                "lxmusic: cross-platform re-search %s/%s/%s -> songmid=%s (duration matched)",
                 src, name, singer, mid,
             )
             return mid
         LOGGER.warning(
-            "lxmusic: 跨平台重搜 %s/%s/%s 未找到时长匹配的歌曲,放弃 fallback (避免错曲)",
+            "lxmusic: cross-platform re-search %s/%s/%s found no duration match, giving up to avoid the wrong track",
             src, name, singer,
         )
         self._songmid_resolve_cache[cache_key] = None
         return None
 
     async def _check_url_playable(self, url: str) -> bool:
-        """HEAD 检查 URL 是否返回音频内容。
+        """Check with a HEAD request whether a URL really serves audio.
 
-        metingapi.nanorocky.top 这类网关代理在某些时段会返回 200 + 空内容
-        （CF 反爬虫拦截），lxserver 服务端用 needle HEAD 解析 302 重定向也
-        拿不到真实音频 URL。把这种 gateway URL 直接交给 ffmpeg 会报
-        "Invalid data found when processing input"。客户端需要自己做一次
-        content-type 检查，过滤掉非音频 URL。
+        Some gateway proxies answer 200 with an empty body when they are
+        blocked, and the server cannot resolve the real audio URL from such a
+        redirect either. Handing that URL to ffmpeg fails with "Invalid data
+        found when processing input", so the client checks the content type and
+        rejects non-audio URLs.
 
-        返回 True: 可播放（content-type 是 audio/* / video/* / m3u8 等）
-        返回 False: 不可播放（text/html 空内容、网关挂了）
+        True: playable, the content type is audio, video or a playlist.
+        False: not playable, e.g. an html body or a dead gateway.
 
-        BUG #33 (2026-09-04) 已知 metingapi.nanorocky.top 整体失效且
-        lxserver 直接返回 gateway URL,这里把该域名直接判为不可用,让
-        /api/music/url 之外的跨平台 fallback 有机会被触发。
+        Known-dead gateway hosts are rejected outright, without a request, so
+        that other fallbacks get a chance instead of waiting on a HEAD.
         """
         if not url or not url.startswith("http"):
             return False
-        # 黑名单:已知会返回 200+空内容 / CF 418 的域名,直接跳过
-        # 避免做 HEAD 请求也拿不到有效反馈
+        # Hosts known to answer 200 with an empty body or a bot-block code are
+        # skipped outright, since even a HEAD gives no usable signal.
         bad_hosts = ("metingapi.nanorocky.top",)
         if any(h in url for h in bad_hosts):
             LOGGER.warning(
-                "lxmusic: URL 命中已知失效网关 url=%s,跳过", url[:80],
+                "lxmusic: url matches a known dead gateway url=%s, skipped", url[:80],
             )
             return False
         try:
@@ -3454,14 +4833,14 @@ class LxMusicProvider(MusicProvider):
                 )
                 if not playable:
                     LOGGER.warning(
-                        "lxmusic: URL content-type=%s 不可播放 url=%s",
+                        "lxmusic: url content-type=%s not playable url=%s",
                         ct, url[:80],
                     )
                 return playable
         except Exception as err:  # noqa: BLE001
-            # 网络错误时让 fallback 继续尝试其他源,不要在这里放过坏 URL
+            # on a network error treat it as unusable and let other sources try
             LOGGER.warning(
-                "lxmusic: HEAD 检查异常 url=%s err=%s,按不可用处理",
+                "lxmusic: HEAD check error url=%s err=%s, treating as unavailable",
                 url[:80], err,
             )
             return False
