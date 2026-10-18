@@ -33,7 +33,7 @@ async def run_setup(session: SetupSession) -> None:
                 type=ConfigEntryType.STRING,
                 required=True,
                 default_value=str(existing.get(CONF_SERVER_URL) or "http://localhost:9527"),
-                description="LX Music 服务端的完整 URL，例如 http://localhost:9527",
+                description="Full URL of the LX Music server, e.g. http://localhost:9527",
             ),
             ConfigEntry(
                 key=CONF_USERNAME,
@@ -44,13 +44,14 @@ async def run_setup(session: SetupSession) -> None:
             ConfigEntry(
                 key=CONF_PASSWORD,
                 type=ConfigEntryType.SECURE_STRING,
-                label="密码",
+                label="Password",
                 required=True,
                 default_value=str(existing.get(CONF_PASSWORD) or ""),
                 description=(
-                    "LX 服务端的登录密码（必填）。如果忘了密码或不知道，"
-                    "请到 lxserver 管理后台（一般是 LX 服务端 Web UI 的"
-                    " 设置/账号管理页面）重置后再回来填写。"
+                    "Login password for the lxserver account (required). "
+                    "Forgot it or never set one? Reset it in the lxserver "
+                    "admin panel (usually the settings / account page of "
+                    "the LX server web UI), then come back."
                 ),
             ),
             ConfigEntry(
@@ -58,14 +59,14 @@ async def run_setup(session: SetupSession) -> None:
                 type=ConfigEntryType.STRING,
                 required=False,
                 default_value=str(existing.get(CONF_DEFAULT_SOURCE) or "wy"),
-                description="获取播放链接时优先使用的音源 (kw/kg/tx/wy/mg)",
+                description="Source preferred when resolving stream URLs (kw/kg/tx/wy/mg)",
             ),
             ConfigEntry(
                 key=CONF_SEARCH_SOURCES,
                 type=ConfigEntryType.STRING,
                 required=False,
                 default_value=str(existing.get(CONF_SEARCH_SOURCES) or "kw,kg,tx,wy,mg"),
-                description="搜索时轮询的音源列表，逗号分隔",
+                description="Comma-separated list of sources polled during search",
             ),
         ],
         step_id="user",
@@ -73,16 +74,17 @@ async def run_setup(session: SetupSession) -> None:
     # 诊断日志：2026-09-04 用户报告填了密码仍报"密码为空"，需要确认 MA 前端
     # 是否真的把 password 字段传回。values[CONF_PASSWORD] 应该是个非空字符串；
     # 如果是 None/空，说明前端 SECURE_STRING 渲染或 form 提交时丢了字段。
+    # 注意只记长度不记明文：密码会永久留在日志里（2026-10-10 代码审查意见）。
     _LOGGER.warning(
         "lxmusic setup_flow DIAG: values keys=%s | server_url=%r | username=%r | "
-        "password_present=%s | password_type=%s | password_value=%r | "
+        "password_present=%s | password_type=%s | password_len=%s | "
         "default_source=%r | search_sources=%r",
         sorted(values.keys()),
         values.get(CONF_SERVER_URL),
         values.get(CONF_USERNAME),
         CONF_PASSWORD in values,
         type(values.get(CONF_PASSWORD)).__name__,
-        values.get(CONF_PASSWORD),
+        len(str(values.get(CONF_PASSWORD) or "")),
         values.get(CONF_DEFAULT_SOURCE),
         values.get(CONF_SEARCH_SOURCES),
     )
@@ -100,7 +102,7 @@ async def run_setup(session: SetupSession) -> None:
         # **不写任何 LOGGER**。如果不这里捕获,日志里看不到任何错误,settings.json
         # 里也没 lxmusic 条目,就完全无法定位根因。
         _LOGGER.exception(
-            "lxmusic setup_flow finish 失败: %s | translation_key=%s | "
+            "lxmusic setup_flow finish failed: %s | translation_key=%s | "
             "values=%r",
             err,
             getattr(err, "translation_key", None),

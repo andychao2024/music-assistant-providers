@@ -11,6 +11,7 @@ import re
 import secrets
 import time
 from collections.abc import AsyncGenerator, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -44,7 +45,7 @@ from music_assistant_models.media_items import (
     Track,
 )
 from music_assistant_models.streamdetails import StreamDetails
-from music_assistant_models.errors import LoginFailed
+from music_assistant_models.errors import LoginFailed, MusicAssistantError
 from music_assistant_models.unique_list import UniqueList
 from music_assistant.models.music_provider import MusicProvider
 
@@ -83,12 +84,14 @@ CONF_NEWSONG_SOURCE = "newsong_source"
 # Off: loveList is no longer synced; items already in the library are kept.
 CONF_SYNC_LOVE_LIST = "sync_love_list"
 
+# In-code display names are English; the zh bundles under translations/
+# localize them via config_entries.*.options.* and media.folder.hot_* keys.
 SOURCE_NAMES = {
-    "kw": "酷我",
-    "kg": "酷狗",
-    "tx": "QQ音乐",
-    "wy": "网易云音乐",
-    "mg": "咪咕音乐",
+    "kw": "Kuwo",
+    "kg": "Kugou",
+    "tx": "QQ Music",
+    "wy": "NetEase Cloud Music",
+    "mg": "Migu Music",
 }
 
 QUALITY_ORDER = ["flac", "320k", "128k"]
@@ -180,11 +183,84 @@ RADIO_BOARD_PICKS = 6
 RADIO_SONGS_PER_BOARD = 10
 # Item id of the dynamic radio playlist, dispatched through get_playlist*.
 RADIO_PLAYLIST_ITEM_ID = "list:fm:radio"
-RADIO_NAME = "洛雪电台"
+RADIO_NAME = "LX Radio"
 # Rotation interval bounds in minutes, exposed as a provider config entry.
 RADIO_INTERVAL_DEFAULT = 60
 RADIO_INTERVAL_MIN = 5
 RADIO_INTERVAL_MAX = 1440
+
+# --------------------------------------------------------------------------- #
+# Provider-local i18n.
+#
+# MA's runtime only loads the core translations/*.json bundles; a custom
+# provider's strings.json is build-time input for the official repo and never
+# reaches a self-hosted instance. So this provider ships its own English
+# source (strings.json, official nested layout) plus zh bundles
+# (translations/zh_*.json, flat fully-qualified layout like the core files)
+# and injects them into the core translation controller at init. setdefault
+# keeps a future core/Lokalise translation authoritative, and any failure
+# just leaves the provider serving its in-code English.
+# --------------------------------------------------------------------------- #
+TRANSLATION_OWNER = "provider.lxmusic"
+_PROVIDER_STRINGS_FILE = Path(__file__).parent / "strings.json"
+_PROVIDER_TRANSLATION_DIR = Path(__file__).parent / "translations"
+_PROVIDER_TRANSLATION_LOCALES = ("zh_CN", "zh_TW")
+
+
+def _flatten_strings(node: dict[str, Any], prefix: str) -> dict[str, str]:
+    """Flatten the nested strings.json layout into fully-qualified keys."""
+    out: dict[str, str] = {}
+    for key, value in node.items():
+        if isinstance(value, dict):
+            out.update(_flatten_strings(value, f"{prefix}.{key}"))
+        elif isinstance(value, str):
+            out[f"{prefix}.{key}"] = value
+    return out
+
+
+async def _register_provider_translations(mass: "MusicAssistant") -> None:
+    """Merge this provider's own strings into the core translation controller.
+
+    English goes into the source bundle; the zh bundles go into the
+    per-locale caches, which are warmed from the core files first so core
+    strings are never shadowed. Best-effort: any problem is logged at debug
+    and the provider simply keeps its English defaults.
+    """
+    try:
+        ctrl = getattr(mass, "translations", None)
+        source = getattr(ctrl, "_source", None)
+        locales = getattr(ctrl, "_locales", None)
+        if not isinstance(source, dict) or not isinstance(locales, dict):
+            return
+        en = _flatten_strings(
+            json.loads(_PROVIDER_STRINGS_FILE.read_text("utf-8")), TRANSLATION_OWNER
+        )
+        for key, value in en.items():
+            source.setdefault(key, value)
+        for locale in _PROVIDER_TRANSLATION_LOCALES:
+            path = _PROVIDER_TRANSLATION_DIR / f"{locale}.json"
+            if not path.is_file():
+                continue
+            # Load the core bundle first (no-op when already loaded or when
+            # core has no such locale); creating the dict before that load
+            # would make ensure_locale_loaded skip the core file forever.
+            try:
+                await ctrl.ensure_locale_loaded(locale)
+            except Exception:  # noqa: BLE001
+                pass
+            bundle = locales.get(locale)
+            if bundle is None:
+                bundle = {}
+                locales[locale] = bundle
+            flat = json.loads(path.read_text("utf-8"))
+            if not isinstance(flat, dict):
+                continue
+            for key, value in flat.items():
+                if isinstance(value, str):
+                    bundle.setdefault(key, value)
+    except Exception as err:  # noqa: BLE001
+        LOGGER.debug("lxmusic: translation injection skipped: %s", err)
+
 
 SUPPORTED_FEATURES = {
     ProviderFeature.SEARCH,
@@ -257,20 +333,19 @@ class LxMusicProvider(MusicProvider):
         ``get_setup_value``; ``config.get_value`` would always return None and
         the provider would fail with a misleading login error.
         """
+        # Inject the provider's own UI strings before anything is serialized.
+        await _register_provider_translations(self.mass)
         self._server_url = str(self.get_setup_value(CONF_SERVER_URL) or "http://localhost:9527").rstrip("/")
         self._username = self.get_setup_value(CONF_USERNAME) or "admin"
         self._password = self.get_setup_value(CONF_PASSWORD) or ""
         self._default_source = self.get_setup_value(CONF_DEFAULT_SOURCE) or "wy"
         # Leaderboard import toggle. Defaults to on; existing playlists stay in
         # the database when turned off, they are just no longer re-yielded.
-        # get_setup_value returns None on the first save, so force the default.
-        self._import_leaderboards = bool(
-            self.get_setup_value(CONF_IMPORT_LEADERBOARDS) or True
-        )
+        # _setup_bool handles both the missing-entry default and the "false"
+        # string encoding; the previous ``or True`` form was always True.
+        self._import_leaderboards = self._setup_bool(CONF_IMPORT_LEADERBOARDS)
         # Square/discover playlist import toggle, independent of the above.
-        self._import_square = bool(
-            self.get_setup_value(CONF_IMPORT_SQUARE) or True
-        )
+        self._import_square = self._setup_bool(CONF_IMPORT_SQUARE)
         raw_sources = self.get_setup_value(CONF_SEARCH_SOURCES) or "kw,kg,tx,wy,mg"
         self._search_sources = [
             s.strip() for s in raw_sources.split(",") if s.strip()
@@ -339,13 +414,18 @@ class LxMusicProvider(MusicProvider):
         # no hint that a provider option is missing.
         if not str(self._username).strip():
             raise LoginFailed(
-                "LX Music username is empty. Set the lxserver login username in "
-                "MA settings -> Providers -> LX Music -> Configure."
+                "Username is empty. Set the lxserver username in the "
+                "provider settings.",
+                translation_key="empty_username",
+                translation_owner=TRANSLATION_OWNER,
             )
         if not str(self._password):
             raise LoginFailed(
-                "LX Music password is empty. Set the lxserver login password in "
-                "MA settings -> Providers -> LX Music -> Configure."
+                "Password is empty. Set the lxserver password in the "
+                "provider settings (reset it in the lxserver admin panel "
+                "if forgotten).",
+                translation_key="empty_password",
+                translation_owner=TRANSLATION_OWNER,
             )
 
         await self._login()
@@ -415,24 +495,24 @@ class LxMusicProvider(MusicProvider):
             ConfigEntry(
                 key=CONF_SERVER_URL,
                 type=ConfigEntryType.STRING,
-                label="服务端地址",
+                label="Server URL",
                 default_value=str(
                     self.get_setup_value(CONF_SERVER_URL) or "http://localhost:9527"
                 ).rstrip("/"),
                 required=True,
-                description="LX Music 服务端的完整 URL，例如 http://localhost:9527",
+                description="Full URL of the LX Music server, e.g. http://localhost:9527",
             ),
             ConfigEntry(
                 key=CONF_USERNAME,
                 type=ConfigEntryType.STRING,
-                label="用户名",
+                label="Username",
                 default_value=str(self.get_setup_value(CONF_USERNAME) or "admin"),
                 required=True,
             ),
             ConfigEntry(
                 key=CONF_PASSWORD,
                 type=ConfigEntryType.SECURE_STRING,
-                label="密码",
+                label="Password",
                 required=True,
                 # SECURE_STRING is echoed masked; fall back to empty so the user
                 # re-enters it when the stored value is unavailable.
@@ -441,71 +521,69 @@ class LxMusicProvider(MusicProvider):
             ConfigEntry(
                 key=CONF_DEFAULT_SOURCE,
                 type=ConfigEntryType.STRING,
-                label="默认音源",
+                label="Default source",
                 default_value=str(self.get_setup_value(CONF_DEFAULT_SOURCE) or "wy"),
                 required=False,
-                description="获取播放链接时优先使用的音源 (kw/kg/tx/wy/mg)",
+                description="Source preferred when resolving stream URLs (kw/kg/tx/wy/mg)",
             ),
             ConfigEntry(
                 key=CONF_SEARCH_SOURCES,
                 type=ConfigEntryType.STRING,
-                label="搜索音源",
+                label="Search sources",
                 default_value=str(
                     self.get_setup_value(CONF_SEARCH_SOURCES) or "kw,kg,tx,wy,mg"
                 ),
                 required=False,
-                description="搜索时轮询的音源列表，逗号分隔",
+                description="Comma-separated list of sources polled during search",
+            ),
+        # Two-way love-list sync toggle: off keeps playlist sync only.
+            ConfigEntry(
+                key=CONF_SYNC_LOVE_LIST,
+                type=ConfigEntryType.BOOLEAN,
+                label="Sync LX hearted favorites",
+                default_value=self._sync_love_list_enabled(),
+                required=False,
+                description=(
+                    "Two-way sync between hearts (favorites) in the LX app / "
+                    "lxserver web player and Music Assistant library "
+                    "favorites: hearts added or removed on the LX side enter "
+                    "or leave MA favorites with the library sync (every 12 "
+                    "hours by default); hearting or un-favoriting in MA writes "
+                    "back to lxserver immediately. When off, hearts are no "
+                    "longer synced; items already in the library stay."
+                ),
             ),
         # Leaderboards and square playlists live in the browse view only, not in
         # library playlists; these toggles show or hide those browse entries.
             ConfigEntry(
                 key=CONF_IMPORT_LEADERBOARDS,
                 type=ConfigEntryType.BOOLEAN,
-                label="浏览页显示排行榜",
-                default_value=bool(
-                    self.get_setup_value(CONF_IMPORT_LEADERBOARDS) or True
-                ),
+                label="Show leaderboards in browse",
+                default_value=self._setup_bool(CONF_IMPORT_LEADERBOARDS),
                 required=False,
                 description=(
-                    "开启时 #/browse → LX Music 下显示排行榜入口(约 50 个榜单)。"
-                    "关闭后该入口消失,不影响其他功能。"
+                    "When on, #/browse → LX Music shows a leaderboards entry "
+                    "(~50 charts). Turning it off only hides that entry; "
+                    "nothing else changes."
                 ),
             ),
             ConfigEntry(
                 key=CONF_IMPORT_SQUARE,
                 type=ConfigEntryType.BOOLEAN,
-                label="浏览页显示广场歌单",
-                default_value=bool(
-                    self.get_setup_value(CONF_IMPORT_SQUARE) or True
-                ),
+                label="Show square playlists in browse",
+                default_value=self._setup_bool(CONF_IMPORT_SQUARE),
                 required=False,
                 description=(
-                    "开启时 #/browse → LX Music 下显示广场歌单入口"
-                    "(每分类 top 5,共约 25~300 个)。关闭后该入口消失。"
-                ),
-            ),
-        # Radio rotation interval. Read per use, so changes apply without a restart.
-            ConfigEntry(
-                key=CONF_RADIO_INTERVAL,
-                type=ConfigEntryType.INTEGER,
-                label="洛雪电台刷新间隔（分钟）",
-                default_value=int(
-                    self.get_setup_value(CONF_RADIO_INTERVAL)
-                    or RADIO_INTERVAL_DEFAULT
-                ),
-                range=(RADIO_INTERVAL_MIN, RADIO_INTERVAL_MAX),
-                required=False,
-                description=(
-                    "洛雪电台每隔多少分钟换一批歌。同一个间隔内每次打开都是"
-                    "同一批歌,跨间隔才换。默认 60 分钟(每小时一次),"
-                    f"可设 {RADIO_INTERVAL_MIN}~{RADIO_INTERVAL_MAX} 分钟。"
+                    "When on, #/browse → LX Music shows a square playlists "
+                    "entry (top 5 per category, ~25-300 total). Turning it "
+                    "off only hides that entry."
                 ),
             ),
         # Per-slot recommendation sources. Read per use, so changes apply at once.
             ConfigEntry(
                 key=CONF_DAILY_SOURCE,
                 type=ConfigEntryType.STRING,
-                label="每日推荐音源",
+                label="Daily picks source",
                 default_value=str(
                     self.get_setup_value(CONF_DAILY_SOURCE) or RECO_SOURCE_DEFAULT
                 ),
@@ -515,14 +593,16 @@ class LxMusicProvider(MusicProvider):
                 ],
                 required=False,
                 description=(
-                    "每日推荐从哪个平台的官方榜单混合取歌(飙升/新歌/原创/热歌等),"
-                    "每天换一批。默认酷我。切换后立即生效,无需重启。"
+                    "Which platform's official charts (rising / new / original "
+                    "/ hot ...) the daily picks mix songs from; a new batch "
+                    "every day. Default Kuwo. Applies immediately, no restart "
+                    "needed."
                 ),
             ),
             ConfigEntry(
                 key=CONF_NEWSONG_SOURCE,
                 type=ConfigEntryType.STRING,
-                label="推荐新曲音源",
+                label="New song picks source",
                 default_value=str(
                     self.get_setup_value(CONF_NEWSONG_SOURCE) or RECO_SOURCE_DEFAULT
                 ),
@@ -532,22 +612,27 @@ class LxMusicProvider(MusicProvider):
                 ],
                 required=False,
                 description=(
-                    "推荐新曲从哪个平台的官方新歌榜混合取歌(新歌/飙升/原创等),"
-                    "默认酷我。切换后立即生效,无需重启。"
+                    "Which platform's official new-song charts (new / rising / "
+                    "original ...) the new-song picks mix songs from. Default "
+                    "Kuwo. Applies immediately, no restart needed."
                 ),
             ),
-        # Two-way love-list sync toggle: off keeps playlist sync only.
+        # Radio rotation interval. Read per use, so changes apply without a restart.
             ConfigEntry(
-                key=CONF_SYNC_LOVE_LIST,
-                type=ConfigEntryType.BOOLEAN,
-                label="同步洛雪红心收藏",
-                default_value=self._sync_love_list_enabled(),
+                key=CONF_RADIO_INTERVAL,
+                type=ConfigEntryType.INTEGER,
+                label="LX Radio refresh interval (minutes)",
+                default_value=int(
+                    self.get_setup_value(CONF_RADIO_INTERVAL)
+                    or RADIO_INTERVAL_DEFAULT
+                ),
+                range=(RADIO_INTERVAL_MIN, RADIO_INTERVAL_MAX),
                 required=False,
                 description=(
-                    "洛雪 App / lxserver 网页端的红心(收藏)与 Music Assistant "
-                    "曲库收藏双向同步:洛雪端加/取消红心会随库同步进入/移出 MA "
-                    "收藏(默认每 12 小时同步一次);在 MA 里点红心或取消收藏也会"
-                    "实时写回洛雪。关闭后红心不再同步,已在曲库里的条目保留。"
+                    "How many minutes LX Radio keeps one batch of songs. "
+                    "Within the same interval every open returns the same "
+                    "batch; it only changes across intervals. Default 60 "
+                    f"(hourly); allowed {RADIO_INTERVAL_MIN}-{RADIO_INTERVAL_MAX}."
                 ),
             ),
         )
@@ -628,7 +713,8 @@ class LxMusicProvider(MusicProvider):
             except Exception:  # noqa: BLE001
                 pass
             raise RuntimeError(
-                f"HTTP {resp.status} {resp.reason} body: {body[:500]}"
+                f"HTTP request failed {resp.status} {resp.reason}, "
+                f"body: {body[:500]}"
             )
         return await resp.json()
 
@@ -655,7 +741,12 @@ class LxMusicProvider(MusicProvider):
         if isinstance(result, dict):
             self._token = result.get("token") or result.get("data", {}).get("token")
         if not self._token:
-            raise RuntimeError("LX Music login failed: no token returned")
+            raise LoginFailed(
+                "Login failed: the server returned no token. Check the "
+                "username and password.",
+                translation_key="login_no_token",
+                translation_owner=TRANSLATION_OWNER,
+            )
         LOGGER.info("lxmusic: logged in to lxserver as %s", self._username)
 
     # ------------------------------------------------------------------ #
@@ -758,7 +849,7 @@ class LxMusicProvider(MusicProvider):
                 # albums: prefer the real album id so tracks can be fetched later
                 if want_album:
                     album_id = self._album_id(item)
-                    album_name = item.get("albumName") or item.get("album") or "未知专辑"
+                    album_name = item.get("albumName") or item.get("album") or "Unknown Album"
                     aid = (
                         f"{source}:{album_id}"
                         if album_id
@@ -807,6 +898,7 @@ class LxMusicProvider(MusicProvider):
                                 item_id=item_id,
                                 provider=self.instance_id,
                                 name=pname,
+                                translation_key=self._virtual_translation_key(pid),
                                 provider_mappings={
                                     ProviderMapping(
                                         item_id=item_id,
@@ -918,7 +1010,8 @@ class LxMusicProvider(MusicProvider):
                 BrowseFolder(
                     item_id="recommendations",
                     provider=self.instance_id,
-                    name="推荐",
+                    name="Recommendations",
+                    translation_key="recommendations",
                 )
             )
             # Per-source "hot" entries. lxserver treats "hot" as a keyword search
@@ -928,7 +1021,8 @@ class LxMusicProvider(MusicProvider):
                     BrowseFolder(
                         item_id=f"source/{source}",
                         provider=self.instance_id,
-                        name=f"{SOURCE_NAMES.get(source, source)} 热门",
+                        name=f"{SOURCE_NAMES.get(source, source)} Hot",
+                        translation_key=f"hot_{source}",
                     )
                 )
             # The user's own playlists reach MA through the library sync, so a
@@ -937,7 +1031,8 @@ class LxMusicProvider(MusicProvider):
                 BrowseFolder(
                     item_id="playlists/recent",
                     provider=self.instance_id,
-                    name="我最近播放",
+                    name="Recently Played",
+                    translation_key="recent_played",
                 )
             )
             if getattr(self, "_import_leaderboards", True):
@@ -945,7 +1040,8 @@ class LxMusicProvider(MusicProvider):
                     BrowseFolder(
                         item_id="playlists/board",
                         provider=self.instance_id,
-                        name="排行榜",
+                        name="Leaderboards",
+                        translation_key="leaderboards",
                     )
                 )
             if getattr(self, "_import_square", True):
@@ -953,7 +1049,8 @@ class LxMusicProvider(MusicProvider):
                     BrowseFolder(
                         item_id="playlists/square",
                         provider=self.instance_id,
-                        name="广场歌单",
+                        name="Square Playlists",
+                        translation_key="square_playlists",
                     )
                 )
             return children
@@ -970,6 +1067,10 @@ class LxMusicProvider(MusicProvider):
                     is_playable=row.is_playable,
                     image=row.image,
                     path=f"{path}/{row.item_id}",
+                    # carry the localization over: the recommendation rows
+                    # already carry keys, the plain folders would drop them
+                    translation_key=row.translation_key,
+                    translation_params=row.translation_params,
                 )
                 for row in rows
             ]
@@ -1021,6 +1122,7 @@ class LxMusicProvider(MusicProvider):
                                 item_id=item_id,
                                 provider=self.instance_id,
                                 name=pname,
+                                translation_key="recent_played",
                             )
                         )
                         break
@@ -1122,7 +1224,7 @@ class LxMusicProvider(MusicProvider):
                         if track:
                             await self._maybe_fetch_lyrics(track, item)
                             return track
-        raise FileNotFoundError(f"Track {prov_track_id} not found")
+        raise FileNotFoundError(f"Track not found: {prov_track_id}")
 
     async def get_album(self, prov_album_id: str) -> Album:
         """Album metadata.
@@ -1132,12 +1234,12 @@ class LxMusicProvider(MusicProvider):
         """
         info = self._album_cache.get(prov_album_id)
         album_name = (
-            info["name"] if info else (self._split_id(prov_album_id)[1] or "未知专辑")
+            info["name"] if info else (self._split_id(prov_album_id)[1] or "Unknown Album")
         )
         return Album(
             item_id=prov_album_id,
             provider=self.instance_id,
-            name=album_name or "未知专辑",
+            name=album_name or "Unknown Album",
             provider_mappings={
                 ProviderMapping(
                     item_id=prov_album_id,
@@ -1153,7 +1255,7 @@ class LxMusicProvider(MusicProvider):
         source = info["source"] if info else self._split_id(prov_album_id)[0]
         real_id = info.get("real_id") if info else None
         album_name = (
-            info["name"] if info else (self._split_id(prov_album_id)[1] or "未知专辑")
+            info["name"] if info else (self._split_id(prov_album_id)[1] or "Unknown Album")
         )
         # 1) fetch the full album by real albumId
         if real_id:
@@ -1185,7 +1287,7 @@ class LxMusicProvider(MusicProvider):
                 return out
         # 3) last resort: search by album name and keep matching albums only
         out = []
-        if album_name and album_name != "未知专辑":
+        if album_name and album_name != "Unknown Album":
             try:
                 for src in self._search_sources:
                     items = await self._search_source(src, album_name, page_size=30)
@@ -1298,6 +1400,7 @@ class LxMusicProvider(MusicProvider):
             item_id=prov_playlist_id,
             provider=self.instance_id,
             name=name,
+            translation_key=self._virtual_translation_key(pid),
             provider_mappings={
                 ProviderMapping(
                     item_id=prov_playlist_id,
@@ -1457,12 +1560,15 @@ class LxMusicProvider(MusicProvider):
         payload = result.get("subsonic-response") if isinstance(result, dict) else None
         if not isinstance(payload, dict):
             raise RuntimeError(
-                f"unexpected Subsonic {endpoint} response: {type(result).__name__}"
+                f"Subsonic {endpoint} unexpected response shape: "
+                f"{type(result).__name__}"
             )
         if payload.get("status") != "ok":
             err = payload.get("error")
             detail = err.get("message") if isinstance(err, dict) else err
-            raise RuntimeError(f"Subsonic {endpoint} failed: {detail or 'unknown'}")
+            raise RuntimeError(
+                f"Subsonic {endpoint} call failed: {detail or 'unknown error'}"
+            )
         return payload
 
     @staticmethod
@@ -1575,39 +1681,53 @@ class LxMusicProvider(MusicProvider):
         fetching happens in get_recommendation_items, which has a 30 second
         budget.
         """
+        # Names/subtitles are English here; the per-source translation keys
+        # (daily_<src> / new_<src>) carry the localized wording instead of
+        # interpolating an English platform name into a Chinese sentence.
+        daily_src = self._daily_source()
+        new_src = self._newsong_source()
         return [
             RecommendationFolder(
                 item_id=RECO_RADIO,
                 provider=self.instance_id,
                 name=RADIO_NAME,
                 icon="mdi:radio",
-                subtitle=f"随机抽取多个排行榜,每 {self._radio_interval_minutes()} 分钟换一批",
+                subtitle=(
+                    "Randomly samples multiple charts, switches to a new "
+                    f"batch every {self._radio_interval_minutes()} minutes"
+                ),
+                translation_key="radio",
+                translation_params=[str(self._radio_interval_minutes())],
             ),
             RecommendationFolder(
                 item_id=RECO_DAILY,
                 provider=self.instance_id,
-                name="每日推荐",
+                name="Daily Picks",
                 icon="mdi:star",
                 subtitle=(
-                    f"{SOURCE_NAMES.get(self._daily_source(), '')}榜单混合,"
-                    "每天换一批"
+                    f"Mixed from {SOURCE_NAMES.get(daily_src, daily_src)} "
+                    "official charts, refreshed daily"
                 ),
+                translation_key=f"daily_{daily_src}",
             ),
             RecommendationFolder(
                 item_id=RECO_NEW,
                 provider=self.instance_id,
-                name="推荐新曲",
+                name="New Song Picks",
                 icon="mdi:music-note",
                 subtitle=(
-                    f"{SOURCE_NAMES.get(self._newsong_source(), '')}新歌榜混合"
+                    f"Mixed from {SOURCE_NAMES.get(new_src, new_src)} "
+                    "new-song charts"
                 ),
+                translation_key=f"new_{new_src}",
             ),
             RecommendationFolder(
                 item_id=RECO_PLAYLISTS,
                 provider=self.instance_id,
-                name="推荐歌单",
+                name="Playlist Picks",
                 icon="mdi:playlist-music",
-                subtitle="lxserver 广场精选歌单",
+                subtitle="Curated square playlists from lxserver",
+                translation_key="picks",
             ),
         ]
 
@@ -1643,7 +1763,7 @@ class LxMusicProvider(MusicProvider):
                 items.append(
                     self._make_virtual_playlist(
                         f"list:songlist:{row.get('source')}:{row.get('id')}",
-                        str(row.get("name") or "歌单"),
+                        str(row.get("name") or "Playlist"),
                         row.get("img"),
                         subtitle=(
                             f"by {row['author']}" if row.get("author") else None
@@ -1949,7 +2069,7 @@ class LxMusicProvider(MusicProvider):
                     item = {
                         "source": src,
                         "id": sl_id,
-                        "name": (sl.get("name") or "未命名歌单").strip(),
+                        "name": (sl.get("name") or "Untitled Playlist").strip(),
                         "author": (sl.get("author") or "").strip(),
                         "img": (sl.get("img") or "").strip(),
                     }
@@ -2083,12 +2203,18 @@ class LxMusicProvider(MusicProvider):
                     break
         except Exception as err:  # noqa: BLE001
             LOGGER.debug("lxmusic: radio cover lookup failed: %s", err)
+        interval = self._radio_interval_minutes()
         return self._make_virtual_playlist(
             RADIO_PLAYLIST_ITEM_ID,
             RADIO_NAME,
             image,
             is_dynamic=True,
-            subtitle=f"随机抽取多个排行榜,每 {self._radio_interval_minutes()} 分钟换一批",
+            subtitle=(
+                "Randomly samples multiple charts, switches to a new "
+                f"batch every {interval} minutes"
+            ),
+            translation_key="radio",
+            translation_params=[str(interval)],
         )
 
     async def _get_radio_tracks(self) -> list[Track]:
@@ -2149,6 +2275,8 @@ class LxMusicProvider(MusicProvider):
         *,
         is_dynamic: bool = False,
         subtitle: str | None = None,
+        translation_key: str | None = None,
+        translation_params: list[str] | None = None,
     ) -> Playlist:
         """Build a virtual or dynamic playlist object, shared by radio and picks."""
         playlist = Playlist(
@@ -2163,6 +2291,8 @@ class LxMusicProvider(MusicProvider):
                 )
             },
             is_dynamic=is_dynamic,
+            translation_key=translation_key,
+            translation_params=translation_params,
         )
         if subtitle:
             playlist.metadata.description = subtitle
@@ -2478,6 +2608,20 @@ class LxMusicProvider(MusicProvider):
     # ------------------------------------------------------------------ #
     # Library sync (love list into MA favorites)
     # ------------------------------------------------------------------ #
+    def _setup_bool(self, key: str, default: bool = True) -> bool:
+        """Read a BOOLEAN config entry as a real bool.
+
+        Two traps make a bare bool(get_setup_value(...)) wrong here: MA may
+        store the value as a string such as "false" (and bool("false") is
+        True), and the entry is absent before the first save, where the
+        default must win. Note that ``value or True`` is also useless since
+        it is always True.
+        """
+        raw = self.get_setup_value(key, default)
+        if isinstance(raw, str):
+            return raw.strip().lower() not in ("false", "0", "off", "no", "")
+        return default if raw is None else bool(raw)
+
     def _sync_love_list_enabled(self) -> bool:
         """Love-list sync toggle from the sync_love_list config entry, on by default.
 
@@ -2485,10 +2629,7 @@ class LxMusicProvider(MusicProvider):
         a change in MA settings takes effect without restarting MA. A BOOLEAN
         entry may arrive as a string such as "false", so parse it here.
         """
-        raw = self.get_setup_value(CONF_SYNC_LOVE_LIST, True)
-        if isinstance(raw, str):
-            return raw.strip().lower() not in ("false", "0", "off", "no", "")
-        return bool(raw)
+        return self._setup_bool(CONF_SYNC_LOVE_LIST, True)
 
     async def get_library_tracks(self) -> AsyncGenerator[Track, None]:
         """Yield the lxserver love list as the source of MA library favorites.
@@ -2510,6 +2651,19 @@ class LxMusicProvider(MusicProvider):
             yield  # type: ignore[misc]
         if not self._sync_love_list_enabled():
             LOGGER.debug("lxmusic: love-list sync disabled, yielding nothing")
+            # Yielding nothing while library_sync_deletions is on (the core
+            # default) would drop every LX favorite from the library, which
+            # contradicts the documented "items already in the library stay".
+            # item_id=None holds back this run's deletion pass for tracks.
+            self.report_skipped_sync_item(
+                MediaType.TRACK,
+                None,
+                MusicAssistantError(
+                    "LX heart sync is turned off; this sync round was skipped.",
+                    translation_key="love_sync_disabled",
+                    translation_owner=TRANSLATION_OWNER,
+                ),
+            )
             return
         # Library sync is infrequent, so bypass the TTL and fetch the current
         # love list to reflect hearts added or removed just before this run.
@@ -2517,6 +2671,18 @@ class LxMusicProvider(MusicProvider):
         data = await self._get_user_lists()
         if not isinstance(data, dict):
             LOGGER.warning("lxmusic: love-list sync could not read /api/user/list, skipping")
+            # Same guard as above: a transient fetch failure must not read as
+            # "the love list is empty" and mass-unfavorite everything.
+            self.report_skipped_sync_item(
+                MediaType.TRACK,
+                None,
+                MusicAssistantError(
+                    "Failed to fetch the hearted playlist; this sync round "
+                    "was skipped.",
+                    translation_key="love_list_fetch_failed",
+                    translation_owner=TRANSLATION_OWNER,
+                ),
+            )
             return
         love_items: list[dict[str, Any]] = []
         for pl_id, _name, songs in self._iter_user_playlists(data):
@@ -2575,13 +2741,21 @@ class LxMusicProvider(MusicProvider):
             )
             return
         if not self._sync_love_list_enabled():
-            raise RuntimeError(
-                "LX Music love-list sync is disabled, so the favorite cannot be "
-                "written back. Enable it in MA settings -> LX Music -> Configure."
+            # FAVORITE_TRACKS_EDIT is declared unconditionally, so the UI still
+            # offers the heart even with sync off; no-op quietly rather than
+            # raising an error into the player.
+            LOGGER.info(
+                "lxmusic: love-list sync disabled, favorite change not "
+                "written back: %s (%s)",
+                "add" if favorite else "remove",
+                prov_item_id,
             )
+            return
         source, song_id = self._split_id(prov_item_id)
         if not song_id:
-            raise RuntimeError(f"LX Music cannot parse track id: {prov_item_id!r}")
+            raise RuntimeError(
+                f"LX Music cannot parse track id: {prov_item_id!r}"
+            )
 
         if favorite:
             music_info = await self._love_music_info(prov_item_id, source, song_id)
@@ -2612,7 +2786,9 @@ class LxMusicProvider(MusicProvider):
         # Invalidate the user-list cache after a successful write so the next
         # library sync or playlist listing sees the new state right away.
         self._user_lists_cache_time = 0.0
-        self._playlist_cache.pop("__love__", None)
+        # Cache entries are keyed by the full provider item id ("list:__love__"),
+        # not the bare pid; popping "__love__" alone never hit anything.
+        self._playlist_cache.pop("list:__love__", None)
 
     async def _request_text(
         self,
@@ -2643,13 +2819,15 @@ class LxMusicProvider(MusicProvider):
                     body = await resp2.text()
                     if resp2.status >= 400:
                         raise RuntimeError(
-                            f"HTTP {resp2.status} {resp2.reason} body: {body[:500]}"
+                            f"HTTP request failed {resp2.status} {resp2.reason}, "
+                            f"body: {body[:500]}"
                         )
                     return body.strip()
             body = await resp.text()
             if resp.status >= 400:
                 raise RuntimeError(
-                    f"HTTP {resp.status} {resp.reason} body: {body[:500]}"
+                    f"HTTP request failed {resp.status} {resp.reason}, "
+                    f"body: {body[:500]}"
                 )
             return body.strip()
 
@@ -2698,9 +2876,15 @@ class LxMusicProvider(MusicProvider):
             LOGGER.debug("lxmusic: library lookup failed %s: %s", prov_item_id, err)
         meta = db_track or await self._love_meta_fallback(prov_item_id)
         if meta is None:
-            raise RuntimeError(
-                f"Track {prov_item_id} is known neither to lxserver nor to Music "
-                "Assistant and cannot be hearted (it may have left the source platform)."
+            LOGGER.warning(
+                "lxmusic: no metadata for %s, cannot heart it", prov_item_id
+            )
+            raise MusicAssistantError(
+                f"Track {prov_item_id} not found on lxserver or in Music "
+                "Assistant; cannot heart it (it may have been removed from "
+                "the source platform).",
+                translation_key="track_info_not_found",
+                translation_owner=TRANSLATION_OWNER,
             )
         # 4) re-search by name plus artist to get the server's full MusicInfo
         singer = ""
@@ -2731,11 +2915,11 @@ class LxMusicProvider(MusicProvider):
             "lxmusic: %s could not be rebuilt from search, hearting from metadata", prov_item_id
         )
         return {
-            "name": getattr(meta, "name", "") or "未知歌曲",
+            "name": getattr(meta, "name", "") or "Unknown Song",
             "singer": "、".join(
                 str(getattr(a, "name", "") or "") for a in artists
                 if getattr(a, "name", "")
-            ) or "未知歌手",
+            ) or "Unknown Artist",
             "source": source,
             "songmid": song_id,
             "albumName": getattr(getattr(meta, "album", None), "name", "") or "",
@@ -2775,46 +2959,61 @@ class LxMusicProvider(MusicProvider):
         - playlists the user created in the lxserver web player
         """
         data = await self._get_user_lists()
-        if data:
-            for pid, pname, songs in self._iter_user_playlists(data):
-                # Skip the recent-play list: it is a virtual playlist exposed
-                # only through the browse path playlists/recent.
-                if pid == "__default__":
-                    continue
-                item_id = f"list:{pid}"
-                self._playlist_cache[item_id] = songs
-                # Use the first track's cover as the playlist cover.
-                first_song = songs[0] if songs else None
-                first_pic = ""
-                if isinstance(first_song, dict):
-                    first_pic = (
-                        first_song.get("img")
-                        or first_song.get("pic")
-                        or first_song.get("image")
-                        or ""
-                    ).strip()
-                playlist = Playlist(
-                    item_id=item_id,
-                    provider=self.instance_id,
-                    name=pname,
-                    provider_mappings={
-                        ProviderMapping(
-                            item_id=item_id,
-                            provider_domain=self.domain,
-                            provider_instance=self.instance_id,
-                        )
-                    },
-                )
-                if first_pic:
-                    playlist.metadata.images = [
-                        MediaItemImage(
-                            type=ImageType.THUMB,
-                            path=first_pic,
-                            provider=self.instance_id,
-                            remotely_accessible=True,
-                        )
-                    ]
-                yield playlist
+        if not data:
+            # Same guard as get_library_tracks: yielding nothing while
+            # library_sync_deletions is on would wipe every LX playlist from
+            # the library on a transient fetch failure.
+            self.report_skipped_sync_item(
+                MediaType.PLAYLIST,
+                None,
+                MusicAssistantError(
+                    "Failed to fetch user playlists; this sync round was "
+                    "skipped.",
+                    translation_key="user_playlists_fetch_failed",
+                    translation_owner=TRANSLATION_OWNER,
+                ),
+            )
+            return
+        for pid, pname, songs in self._iter_user_playlists(data):
+            # Skip the recent-play list: it is a virtual playlist exposed
+            # only through the browse path playlists/recent.
+            if pid == "__default__":
+                continue
+            item_id = f"list:{pid}"
+            self._playlist_cache[item_id] = songs
+            # Use the first track's cover as the playlist cover.
+            first_song = songs[0] if songs else None
+            first_pic = ""
+            if isinstance(first_song, dict):
+                first_pic = (
+                    first_song.get("img")
+                    or first_song.get("pic")
+                    or first_song.get("image")
+                    or ""
+                ).strip()
+            playlist = Playlist(
+                item_id=item_id,
+                provider=self.instance_id,
+                name=pname,
+                translation_key=self._virtual_translation_key(pid),
+                provider_mappings={
+                    ProviderMapping(
+                        item_id=item_id,
+                        provider_domain=self.domain,
+                        provider_instance=self.instance_id,
+                    )
+                },
+            )
+            if first_pic:
+                playlist.metadata.images = [
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=first_pic,
+                        provider=self.instance_id,
+                        remotely_accessible=True,
+                    )
+                ]
+            yield playlist
 
     def _library_item_needs_update(
         self, library_item, prov_item
@@ -3096,7 +3295,7 @@ class LxMusicProvider(MusicProvider):
                         item.get("albumName")
                         or item.get("name")
                         or item.get("album")
-                        or "未知专辑"
+                        or "Unknown Album"
                     )
                     albums.append(self._register_album(source, aname, aid_real))
             except Exception as err:  # noqa: BLE001
@@ -3601,7 +3800,7 @@ class LxMusicProvider(MusicProvider):
                                 continue
                             seen_sl_ids.add(sl_id)
                             picked += 1
-                            sl_name = (sl.get("name") or "未命名歌单").strip()
+                            sl_name = (sl.get("name") or "Untitled Playlist").strip()
                             sl_author = (sl.get("author") or "").strip()
                             display = f"LX ·{tag_id}:{sl_name}"
                             if sl_author:
@@ -3687,7 +3886,7 @@ class LxMusicProvider(MusicProvider):
         # the full names in SOURCE_NAMES, so they are kept in their own table;
         # add new platforms to both.
         source_label: dict[str, str] = {
-            "kg": "酷狗", "kw": "酷我", "wy": "网易", "tx": "QQ", "mg": "咪咕",
+            "kg": "Kugou", "kw": "Kuwo", "wy": "NetEase", "tx": "QQ", "mg": "Migu",
         }
         boards_resp_map: dict[str, dict[str, Any]] = {}
         for src in leaderboard_sources:
@@ -3716,7 +3915,7 @@ class LxMusicProvider(MusicProvider):
                 if not isinstance(board, dict):
                     continue
                 bangid = str(board.get("bangid") or "").strip()
-                bname = (board.get("name") or "未命名榜单").strip()
+                bname = (board.get("name") or "Untitled Chart").strip()
                 if not bangid:
                     continue
                 all_jobs.append({
@@ -4112,6 +4311,16 @@ class LxMusicProvider(MusicProvider):
         return out
 
     @staticmethod
+    def _virtual_translation_key(pid: str) -> str | None:
+        """Translation slug for the virtual playlists, None for real user ones.
+
+        The recent-play and love lists have stable ids, so their names can be
+        localized through media.playlist.<slug>.name instead of freezing one
+        language into the stored name.
+        """
+        return {"__default__": "recent_played", "__love__": "love"}.get(pid)
+
+    @staticmethod
     def _iter_user_playlists(
         data: dict[str, Any]
     ) -> list[tuple[str, str, list[dict[str, Any]]]]:
@@ -4128,8 +4337,8 @@ class LxMusicProvider(MusicProvider):
         out: list[tuple[str, str, list[dict[str, Any]]]] = []
         # defaultList is the recent-play list and loveList the love list; MA shows the latter as a favorites playlist
         for key, virtual_id, virtual_name in (
-            ("defaultList", "__default__", "我最近播放"),
-            ("loveList", "__love__", "洛雪收藏"),
+            ("defaultList", "__default__", "Recently Played"),
+            ("loveList", "__love__", "LX Favorites"),
         ):
             lst = data.get(key)
             if isinstance(lst, list):
@@ -4149,7 +4358,7 @@ class LxMusicProvider(MusicProvider):
                 out.append(
                     (
                         pl_id,
-                        lst.get("name", "未命名歌单"),
+                        lst.get("name", "Untitled Playlist"),
                         lst.get("list", []),
                     )
                 )
@@ -4314,10 +4523,10 @@ class LxMusicProvider(MusicProvider):
         song_id = self._item_song_id(item)
         if not song_id:
             return None
-        name = item.get("name") or item.get("songName") or "未知歌曲"
+        name = item.get("name") or item.get("songName") or "Unknown Song"
         singer_names, artist_real_id = self._singer_info(item)
-        artist_name = singer_names[0] if singer_names else "未知歌手"
-        album_name = item.get("albumName") or item.get("album") or "未知专辑"
+        artist_name = singer_names[0] if singer_names else "Unknown Artist"
+        album_name = item.get("albumName") or item.get("album") or "Unknown Album"
         album_real_id = self._album_id(item)
         duration = item.get("interval") or item.get("duration") or item.get("time") or 0
         if isinstance(duration, str):
