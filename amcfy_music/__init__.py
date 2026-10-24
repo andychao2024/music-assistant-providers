@@ -3,7 +3,8 @@ Amcfy Music Subsonic Bridge Plugin for Music Assistant.
 
 Subsonic API bridge for Amcfy Music client - browse and stream all MA music
 sources (local files, Spotify, Tidal, NetEase, etc.) via Subsonic protocol.
-v1.0.8
+Compatible with Music Assistant 2.10.x and 2.11.x.
+v1.3.6
 """
 
 from __future__ import annotations
@@ -13,6 +14,7 @@ from datetime import datetime
 
 import base64
 import hashlib
+import inspect
 import json
 import os
 import random
@@ -34,6 +36,8 @@ from music_assistant_models.enums import ConfigEntryType, ContentType, MediaType
 from music_assistant_models.media_items import Album, Artist, MediaItemImage, Playlist, Track
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncIterator
+
     from music_assistant_models.config_entries import ConfigValueType, ProviderConfig
     from music_assistant_models.provider import ProviderManifest
     from music_assistant.mass import MusicAssistant
@@ -222,13 +226,11 @@ def _guess_content_type(track: Track) -> tuple[str, str]:
         pm = next(iter(track.provider_mappings))
         af = getattr(pm, "audio_format", None)
     if af:
-        # 优先用 MA AudioFormat.content_type(ContentType 枚举)
         ctype = getattr(af, "content_type", None)
         if ctype and str(ctype) not in ("UNKNOWN", "?"):
             ct = get_mime_type(ctype)
             suffix = str(ctype).lower()
         else:
-            # fallback: 从 output_format_str 解析
             fmt = (af.output_format_str or "").lower()
             parsed = ContentType.try_parse(fmt) if hasattr(ContentType, "try_parse") else None
             if parsed and str(parsed) not in ("UNKNOWN", "?"):
@@ -252,13 +254,22 @@ def _song_dict(track: Track) -> dict:
     album = track.album
     suffix, ct = _guess_content_type(track)
     bit_rate = None
-    file_size = 0
+    bit_depth = 0
+    sample_rate = 0
+    channels = 0
+    duration = track.duration or 0
     if track.provider_mappings:
         pm = next(iter(track.provider_mappings))
         af = getattr(pm, "audio_format", None)
         if af:
             bit_rate = af.bit_rate
-        file_size = getattr(pm, "file_size", 0) or 0
+            bit_depth = af.bit_depth
+            sample_rate = af.sample_rate
+            channels = af.channels
+    # MA 的 ProviderMapping 不暴露 file_size（filesystem_* provider 内部维护但不写入 mapping）。
+    # 用 bit_rate(kbps) × duration(秒) 估算：bytes = kbps * 1000 * sec / 8。
+    # 对 VBR / FLAC 有偏差（FLAC 会比实际大，因未算编码器开销），但比 0 强。
+    file_size = int(bit_rate * 1000 * duration / 8) if bit_rate and duration else 0
     genres = track.metadata and track.metadata.genres
     if genres and not hasattr(genres, '__iter__'):
         genres = [genres] if genres else []
@@ -289,6 +300,9 @@ def _song_dict(track: Track) -> dict:
         "artistId": artist.uri if artist else "",
         "genre": next(iter(genres), "") if genres else "",
         "bitRate": bit_rate or 0,
+        "bitDepth": bit_depth,
+        "samplingRate": sample_rate,
+        "channelCount": channels,
     }
 
 
@@ -372,6 +386,95 @@ def _persist_token(mass, instance_id: str, token: str) -> None:
 
 
 CACHE_TTL = 300
+
+# BUG #110: 歌词净化 — MA 2.x dispatch chain 里 neteasecloudmusic(官方内置)
+# 声明了 LYRICS 特性,会优先 netease_lyrics 把歌词写到 track.metadata.lyrics。
+# 但官方插件用的是 lxserver /lyric 端点,而 lxserver 对一些没有真同步歌词
+# 的歌曲(如 Klinn "Afterglow" / id=3390138660)会把 YRC 元信息行
+# (作词/作曲/编曲)混进纯文本返回,导致 APP 看到 "作词 : Klinn" 这种噪声。
+# 另 lxserver 还会生成 [NaN:NaN.NaN] 前缀污染,以及 [00:00.00-1] ELRC 元信息。
+# 这里做最后一道清洗 — 出口侧,不动 MA 核心。
+_LRC_TS_RE = re.compile(r"^\[(\d{1,2}):(\d{2})(?:\.(\d{1,3}))?\]")
+_LRC_ELRC_RE = re.compile(r"^\[(\d{1,2}):(\d{2})\.(\d{1,3})-\d+\]")
+_LRC_HEADER_RE = re.compile(r"^\[(ti|ar|al|au|by|offset|length|kana|language):[^\]]*\]\s*$", re.IGNORECASE)
+_LRC_NAN_RE = re.compile(r"^\[(?:NaN|[-+]?(?:\d*\.\d+|\d+)):NaN(?:\.NaN)?\]", re.IGNORECASE)
+_METADATA_LINE_RE = re.compile(
+    r"^\s*("
+    r"作词|作曲|编曲|制作|混音|母带|录音|出品|监制|统筹|总策划|"
+    r"艺人|翻译|出处|发行|封面|推广|企宣|经纪人|"
+    r"OP|SP|"
+    r"Lyrics?|Composers?|Arrangers?|Producers?|Mix|Master|Recordings?|"
+    r"Labels?|Publishers?|Distributions?|Cover|Designs?|Vocals?|Perform"
+    r")\s*[:：]\s*\S",
+    re.IGNORECASE,
+)
+_PLACEHOLDER_LINE_RE = re.compile(
+    r"^\s*(?:暂无歌词|纯音乐[，,]?\s*请欣赏|暂无歌词[，,]?\s*请欣赏)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_garbage_line(line: str) -> bool:
+    """判断单行是不是元信息/占位/NaN/header/ELRC 元信息,需要丢弃。
+
+    被同步歌词和纯文本歌词复用。
+    """
+    if not line:
+        return True
+    s = line.strip()
+    if not s:
+        return True
+    if _PLACEHOLDER_LINE_RE.match(s):
+        return True
+    if _LRC_HEADER_RE.match(s):
+        return True
+    if _LRC_NAN_RE.match(s):
+        return True
+    # ELRC 元信息时间戳 [mm:ss.xxx-N],数字后缀不是真时间
+    if _LRC_ELRC_RE.match(s):
+        # 只有形如 [mm:ss.xxx-N] 但没内容(整行就是时间戳)才算元信息
+        stripped_ts = _LRC_ELRC_RE.sub("", s, count=1).strip()
+        if _METADATA_LINE_RE.match(stripped_ts):
+            return True
+        if not stripped_ts:
+            return True
+        # ELRC 时间戳本身可疑,即使有内容也丢掉 — 这种几乎都是元信息
+        return True
+    # 标准时间戳 + 元信息文本(如 [00:00.00] 作词 : Klinn)
+    if _LRC_TS_RE.match(s):
+        body = _LRC_TS_RE.sub("", s, count=1).strip()
+        if _METADATA_LINE_RE.match(body):
+            return True
+        return False
+    # 纯文本元信息行(如 "作词 : Klinn")
+    if _METADATA_LINE_RE.match(s):
+        return True
+    return False
+
+
+def _sanitize_lyrics_text(text: str) -> str:
+    """清洗纯文本歌词:去掉元信息行/占位行,保留真实歌词。"""
+    if not text:
+        return text
+    cleaned: list[str] = []
+    for raw in text.splitlines():
+        if _is_garbage_line(raw):
+            continue
+        cleaned.append(raw)
+    return "\n".join(cleaned).strip()
+
+
+def _sanitize_lyrics_lrc(lrc: str) -> str:
+    """清洗 LRC 歌词:丢掉元信息/占位/[NaN]/ELRC/header 行,保留真同步行。"""
+    if not lrc:
+        return lrc
+    cleaned: list[str] = []
+    for raw in lrc.splitlines():
+        if _is_garbage_line(raw):
+            continue
+        cleaned.append(raw.strip())
+    return "\n".join(cleaned).strip()
+
 
 class AmcfyBridgePlugin(PluginProvider):
     _unload_callbacks: list[Callable[[], None]]
@@ -1058,6 +1161,11 @@ class AmcfyBridgePlugin(PluginProvider):
                     lrc = raw[1] if raw else None
             except Exception:
                 pass
+        # BUG #110: 出口清洗 — neteasecloudmusic 官方插件通过 lxserver /lyric 端点
+        # 拿到的是脏数据(混元信息 / [NaN:NaN.NaN] / ELRC [00:00.00-1] 元信息行),
+        # 这里洗一遍,真同步歌词/真纯文本歌词不动,只丢噪声行。
+        plain = _sanitize_lyrics_text(plain) if plain else None
+        lrc = _sanitize_lyrics_lrc(lrc) if lrc else None
         data = (plain, lrc)
         if len(self._lyrics_cache) > 200:
             cutoff = now - CACHE_TTL
@@ -1251,6 +1359,20 @@ class AmcfyBridgePlugin(PluginProvider):
             payload["song"] = []
         return self._respond({wrapper: payload})
 
+    async def _iter_playlist_tracks(self, item_id: str, provider: str) -> AsyncIterator[Track]:
+        # MA 2.10.x: playlists.tracks() 是 async generator;
+        # MA 2.11+: 改为协程返回 list。此处两种形态都兼容。
+        result = self.mass.music.playlists.tracks(item_id, provider)
+        if inspect.isasyncgen(result):
+            async for track in result:
+                yield track
+        elif inspect.isawaitable(result):
+            for track in await result:
+                yield track
+        else:
+            for track in result:
+                yield track
+
     async def handle_get_playlists(self, request: web.Request, params: dict[str, str]) -> web.Response:
         playlists = await self.mass.music.playlists.library_items(limit=LIBRARY_MAX)
 
@@ -1258,7 +1380,7 @@ class AmcfyBridgePlugin(PluginProvider):
             cnt = 0
             dur = 0
             try:
-                async for t in self.mass.music.playlists.tracks(pl.item_id, pl.provider):
+                async for t in self._iter_playlist_tracks(pl.item_id, pl.provider):
                     if isinstance(t, Track):
                         cnt += 1
                         dur += t.duration or 0
@@ -1301,7 +1423,7 @@ class AmcfyBridgePlugin(PluginProvider):
 
         tracks: list[Track] = []
         try:
-            async for t in self.mass.music.playlists.tracks(playlist.item_id, playlist.provider):
+            async for t in self._iter_playlist_tracks(playlist.item_id, playlist.provider):
                 if isinstance(t, Track):
                     tracks.append(t)
         except Exception:
@@ -1664,7 +1786,6 @@ class AmcfyBridgePlugin(PluginProvider):
                             )
                             await buffer_queue.put(_remaining)
                             bytes_produced += len(_remaining)
-                    # 正常读 src.content 剩余字节
                     while True:
                         if _shared["aborted"] or (request.transport and request.transport.is_closing()):
                             self.logger.info(
@@ -1691,7 +1812,6 @@ class AmcfyBridgePlugin(PluginProvider):
                         bytes_produced += len(chunk)
                     return  # caller-src 路径结束(由 caller 在外层 release src)
 
-                # 老路径:caller 没提供 src,自己 GET
                 async with self.mass.http_session.get(
                     url, headers=proxy_headers,
                     # BUG #63 v1.2.6: 30s 太短,切大 FLAC 慢节点 30s 内读不完;改为 120s
@@ -1733,7 +1853,6 @@ class AmcfyBridgePlugin(PluginProvider):
                         # 跳过的字节不计入 bytes_produced(客户端实际没收到)
                         if _netease_skip > 0:
                             if len(chunk) <= _netease_skip:
-                                # 整个 chunk 都属于要跳过的部分,直接丢弃继续读
                                 _netease_skip -= len(chunk)
                                 continue
                             chunk = chunk[_netease_skip:]
@@ -2008,7 +2127,6 @@ class AmcfyBridgePlugin(PluginProvider):
                     "(stream_previews=True) — client will EOF cleanly after ~88s",
                     mapping.provider_domain, mapping.item_id, track_duration, stream_duration,
                 )
-                # 不 return None,继续走 stream 路径
             else:
                 self.logger.info(
                     "Provider %s only offers a preview snippet for %s "
@@ -2133,13 +2251,11 @@ class AmcfyBridgePlugin(PluginProvider):
                             await probe_src.release()
                             probe_src = None
                             continue
-                        # 嗅探:读前 8 字节
                         _head = await probe_src.content.read(8)
                         if not _head:
                             await probe_src.release()
                             probe_src = None
                             continue
-                        # FLAC magic: 66 4c 61 43 = b"fLaC"
                         if _head[:4] == b"fLaC":
                             pre_chunk = _head
                             source = _actual_source
@@ -2170,7 +2286,6 @@ class AmcfyBridgePlugin(PluginProvider):
                                 _attempt + 1, _source_host, len(pre_chunk),
                             )
                             break
-                        # 不是 FLAC → 释放 src,准备重试
                         _detail = self._classify_probe_bytes(_head)
                         self.logger.warning(
                             "stream: BUG #62 v1.2.6 sniff FAIL (same-conn) | attempt=%d | detail=%s | url_host=%s",
@@ -2233,7 +2348,6 @@ class AmcfyBridgePlugin(PluginProvider):
                         upstream_resp=probe_src, pre_chunk=pre_chunk,
                     )
                 else:
-                    # 老路径:_proxy_stream 自己 GET
                     result = await self._proxy_stream(resp, source, request, seek_pos, suffix)
             finally:
                 # BUG #62 v1.2.6: caller-src 路径下 _proxy_stream 不用 async with,

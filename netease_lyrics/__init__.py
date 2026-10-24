@@ -1,7 +1,7 @@
 """
 Netease Cloud Music API Lyrics Metadata Provider for Music Assistant
 网易云音乐 API 歌词自动补全（支持毫秒级歌词同步）
-Version 1.5.0 - 优化匹配准确率、识别率与歌词滚动；双语歌词恢复 1.3.0 精确时间戳配对方式
+Version 1.7.0 - 适配 Music Assistant 2.11.x
 获取最新版本 https://gitee.com/andychao2020/music-assistant-providers
 """
 
@@ -26,7 +26,7 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
-PLUGIN_VERSION = "1.5.0"
+PLUGIN_VERSION = "1.7.0"
 
 SUPPORTED_FEATURES = {
     ProviderFeature.TRACK_METADATA,
@@ -34,7 +34,6 @@ SUPPORTED_FEATURES = {
 }
 
 
-# 配置项常量
 class ConfigKeys:
     """配置项键名常量类"""
 
@@ -44,8 +43,7 @@ class ConfigKeys:
     LYRICS_DISPLAY_MODE = "lyrics_display_mode"
 
 
-# 配置项默认值
-DEFAULT_BASE_URL = "http://localhost:3003"
+DEFAULT_BASE_URL = "http://localhost:3000"
 DEFAULT_UPDATE_EXISTING_LYRICS = False
 DEFAULT_LYRICS_OFFSET_MS = 0
 DEFAULT_LYRICS_DISPLAY_MODE = "bilingual"
@@ -66,11 +64,31 @@ LYRICS_DISPLAY_MODE_OPTIONS = [
 LRC_TIMESTAMP_PATTERN = re.compile(r"\[(\d{1,2}):(\d{2})\.(\d{2,3})\]")
 NON_STANDARD_LRC_PATTERN = re.compile(r"\[(\d{1,2}):(\d{2})\](?!\.)")
 NORMALIZED_LRC_PATTERN = re.compile(r"^\[(\d{2}):(\d{2})\.(\d{2,3})\]\s*(.*)$")
+# 增强 LRC (ELRC) 格式：[mm:ss.xx-N] — N 为歌曲总时长(秒),由 lxserver 转码产生
+ELRC_TIMESTAMP_PATTERN = re.compile(r"^\[(\d{1,2}):(\d{2})\.(\d{2,3})-\d+\]\s*(.*)$")
 
-# 搜索关键词清洗：去掉括号/收录/版本标注与 feat 信息
 _CLEAN_BRACKET_RE = re.compile(r"[\[\(][^\]\)]*[\]\)]")
 _CLEAN_FEAT_RE = re.compile(r"\b(feat\.?|featuring|ft\.?|with)\b.*$", re.I)
 _CLEAN_VERSION_RE = re.compile(r"\([^)]*(live|remix|cover|伴奏|原版|inst|instrumental)[^)]*\)", re.I)
+
+# 元信息关键词（中英文 + 全半角冒号），用于识别"作词 : XXX"这类元信息行
+# 用户偏好:有真歌词时保留元信息头部,只有元信息时才丢弃
+# 元信息行格式: "作词 : XXX" 或 "Lyrics by: XXX" - 关键字在前,冒号在后
+_METADATA_PREFIX_RE = re.compile(
+    r"^\s*("
+    r"作词|作曲|编曲|制作|混音|母带|录音|出品|监制|统筹|总策划|"
+    r"艺人|翻译|出处|发行|封面|推广|企宣|经纪人|"
+    r"OP|SP|"
+    r"Lyrics?|Composers?|Arrangers?|Producers?|Mix|Master|Recordings?|"
+    r"Labels?|Publishers?|Distributions?|Cover|Designs?|Vocals?|Perform"
+    r")\s*[:：]\s*\S",
+    re.IGNORECASE,
+)
+
+# 占位文本 - NetEase 在无歌词时返回的提示
+_PLACEHOLDER_RE = re.compile(
+    r"^\s*(暂无歌词|纯音乐[，,]?\s*请欣赏|暂无歌词[，,]?\s*请欣赏)\s*$"
+)
 
 
 async def setup(
@@ -83,7 +101,6 @@ async def setup(
 class NeteaseMusicProvider(MetadataProvider):
     """云音乐歌词插件：提供毫秒级同步歌词"""
 
-    # 配置项属性
     base_url: str
     update_existing_lyrics: bool
     lyrics_offset_ms: int
@@ -157,10 +174,11 @@ class NeteaseMusicProvider(MetadataProvider):
         if self.lyrics_display_mode not in ("bilingual", "original", "translation"):
             self.lyrics_display_mode = DEFAULT_LYRICS_DISPLAY_MODE
 
-        # 拼接 API 地址
         base = self.base_url.rstrip("/")
         self.search_api_url = f"{base}/cloudsearch"
         self.lyric_api_url = f"{base}/lyric"
+        # NetEase 官方结构化端点:返回 YRC/LRC 混合格式,元信息与歌词天然分离
+        self.lyric_new_api_url = f"{base}/lyric/new"
 
         # 限流参数（本地 API 服务器，提高并发）
         self.rate_limit = 50 if self.base_url == DEFAULT_BASE_URL else 5
@@ -174,9 +192,7 @@ class NeteaseMusicProvider(MetadataProvider):
             f"显示模式: {self.lyrics_display_mode}"
         )
 
-    # ------------------------------------------------------------------
     # 名称清洗与匹配
-    # ------------------------------------------------------------------
     @staticmethod
     def _clean_search_name(name: str) -> str:
         """清洗歌名用于搜索关键词：去括号/版本/feat 标注，保留核心词"""
@@ -230,9 +246,7 @@ class NeteaseMusicProvider(MetadataProvider):
         # 标题匹配一般时，艺术家权重高一点，但保留标题的贡献
         return max(artist_score * 0.8 + title_score * 0.2, artist_score, title_score)
 
-    # ------------------------------------------------------------------
     # 网络请求（均带缓存与限流）
-    # ------------------------------------------------------------------
     @use_cache(3600 * 24 * 14)
     @throttle_with_retries
     async def _search_api(self, keywords: str) -> list[dict[str, Any]]:
@@ -259,7 +273,6 @@ class NeteaseMusicProvider(MetadataProvider):
         name = self._clean_search_name(track_name)
         artist_str = " ".join(a for a in artists if a)
 
-        # 依次尝试：歌名+艺术家 -> 仅歌名 -> 仅艺术家
         strategies = []
         if name:
             if artist_str:
@@ -302,43 +315,66 @@ class NeteaseMusicProvider(MetadataProvider):
 
         始终返回两个字符串（无值用空串），避免 MA use_cache 还原时丢弃
         None 元素导致解包失败（not enough values to unpack）。
+
+        端点策略:优先 /lyric/new(NetEase 官方结构化端点,YRC/LRC 混合格式,元信息天然分离),
+        失败时回退 /lyric(lxserver 聚合转码产物,可能含 ELRC 元信息)。
+        对每个端点返回的原文+翻译都做"同步/纯文本/元信息/占位"三分类,过滤掉
+        元信息/占位后根据"是否真有同步行"决定返回 LRC 还是纯文本。
         """
         params = {"id": song_id, "lv": -1, "kv": -1, "tv": -1}
-        try:
-            async with self.mass.http_session.get(self.lyric_api_url, params=params) as response:
-                response.raise_for_status()
-                if response.status == 204:
-                    return "", ""
+        for endpoint in (self.lyric_new_api_url, self.lyric_api_url):
+            try:
+                async with self.mass.http_session.get(endpoint, params=params) as response:
+                    if response.status == 204:
+                        continue
+                    response.raise_for_status()
+                    data = cast("dict[str, Any]", await response.json())
+                    synced_lyrics = data.get("lrc", {}).get("lyric", "") or ""
+                    translated_lyrics = data.get("tlyric", {}).get("lyric", "") or ""
 
-                data = cast("dict[str, Any]", await response.json())
-                synced_lyrics = data.get("lrc", {}).get("lyric", "") or ""
-                translated_lyrics = data.get("tlyric", {}).get("lyric", "") or ""
+                    o_synced, o_plain = self._parse_yrc_lrc(synced_lyrics)
+                    t_synced, t_plain = self._parse_yrc_lrc(translated_lyrics)
 
-                normalized_lyrics = self._normalize_lrc(synced_lyrics)
-                normalized_translated = self._normalize_lrc(translated_lyrics)
+                    o_real_synced = [(ts, t) for ts, t in o_synced if not self._is_metadata_or_placeholder(t)]
+                    t_real_synced = [(ts, t) for ts, t in t_synced if not self._is_metadata_or_placeholder(t)]
+                    o_real_plain = [t for t in o_plain if not self._is_metadata_or_placeholder(t)]
+                    t_real_plain = [t for t in t_plain if not self._is_metadata_or_placeholder(t)]
 
-                if normalized_lyrics or normalized_translated:
+                    if o_real_synced or t_real_synced:
+                        orig_out = self._build_lrc_from_synced(o_real_synced) if o_real_synced else ""
+                        trans_out = self._build_lrc_from_synced(t_real_synced) if t_real_synced else ""
+                        self.logger.debug(
+                            f"[云音乐歌词插件] 获取歌词成功 | 端点: {endpoint} | 歌曲ID: {song_id} | "
+                            f"原文同步行: {len(o_real_synced)} | 翻译同步行: {len(t_real_synced)}"
+                        )
+                        return orig_out, trans_out
+
+                    if o_real_plain or t_real_plain:
+                        orig_out = "\n".join(o_real_plain) if o_real_plain else ""
+                        trans_out = "\n".join(t_real_plain) if t_real_plain else ""
+                        self.logger.debug(
+                            f"[云音乐歌词插件] 纯文本歌词(过滤元信息) | 端点: {endpoint} | "
+                            f"歌曲ID: {song_id} | 原文行数: {len(o_real_plain)}"
+                        )
+                        return orig_out, trans_out
+
                     self.logger.debug(
-                        f"[云音乐歌词插件] 获取歌词成功 | 歌曲ID: {song_id} | "
-                        f"原文有效: {bool(normalized_lyrics)} | 翻译有效: {bool(normalized_translated)}"
+                        f"[云音乐歌词插件] 无真歌词 | 端点: {endpoint} | 歌曲ID: {song_id}"
                     )
-                    return normalized_lyrics, normalized_translated
-                if synced_lyrics:
-                    # 纯文本歌词（无时间戳）
-                    self.logger.debug(f"[云音乐歌词插件] 纯文本歌词（无时间戳）| 歌曲ID: {song_id}")
-                    return synced_lyrics, ""
-                self.logger.debug(f"[云音乐歌词插件] 标准化后为空 | 歌曲ID: {song_id}")
-        except (ClientResponseError, json.JSONDecodeError, ContentTypeError) as e:
-            self.logger.debug(f"[云音乐歌词插件] 获取歌词失败 | 歌曲ID: {song_id} | 错误: {e}")
-        except Exception as e:
-            self.logger.debug(
-                f"[云音乐歌词插件] 获取歌词异常 | 歌曲ID: {song_id} | 错误: {e} | 类型: {type(e).__name__}"
-            )
+            except (ClientResponseError, json.JSONDecodeError, ContentTypeError) as e:
+                self.logger.debug(
+                    f"[云音乐歌词插件] 获取歌词失败 | 端点: {endpoint} | 歌曲ID: {song_id} | 错误: {e}"
+                )
+                continue
+            except Exception as e:
+                self.logger.debug(
+                    f"[云音乐歌词插件] 获取歌词异常 | 端点: {endpoint} | 歌曲ID: {song_id} | "
+                    f"错误: {e} | 类型: {type(e).__name__}"
+                )
+                continue
         return "", ""
 
-    # ------------------------------------------------------------------
     # LRC 处理
-    # ------------------------------------------------------------------
     def _normalize_lrc(self, lrc_content: str) -> str:
         """标准化歌词格式：过滤元信息头与空行"""
         if not lrc_content:
@@ -353,6 +389,140 @@ class NeteaseMusicProvider(MetadataProvider):
                 normalized_lines.append(line)
 
         return "\n".join(normalized_lines)
+
+    def _parse_yrc_lrc(self, raw: str) -> tuple[list[tuple[int, str]], list[str]]:
+        """三分类解析原始歌词文本。
+
+        NetEase API 在不同端点可能返回以下格式混合:
+          - LRC  [mm:ss.xx] 文本         → 同步行
+          - LRC  [mm:ss] 文本            → 同步行
+          - LRC  [mm:ss.xx-N] 文本       → ELRC(lxserver 转码产物),常见作元信息载体
+          - YRC  {\\"t\\":-1,\\"c\\":[...]}   → 元信息/标题(忽略)
+          - YRC  {\\"t\\":0,\\"c\\":[...]}    → 同步行
+          - 纯文本(无时间戳)             → 纯文本行
+
+        返回:
+          (同步行列表[(ms, text)], 纯文本行列表[str])
+        """
+        synced: list[tuple[int, str]] = []
+        plain: list[str] = []
+
+        if not raw:
+            return synced, plain
+
+        for line in raw.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            # LRC 元信息头 [ti:...][ar:...][al:...][au:...][by:...][offset:...][length:...]
+            if stripped.startswith("[") and stripped.endswith("]") and ":" in stripped[1:-1]:
+                inner = stripped[1:-1].split(":", 1)[0].lower()
+                if inner in {"ti", "ar", "al", "au", "by", "offset", "length", "kana", "language"}:
+                    continue
+                # [00:00.00] 形式的时间戳行以 [ 开头但不以内 ] 形式包含 :
+                # 已由后续 NORMALIZED_LRC_PATTERN / NON_STANDARD_LRC_PATTERN 处理
+
+            if stripped.startswith("{") and stripped.endswith("}"):
+                try:
+                    obj = json.loads(stripped)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                text = self._extract_yrc_text(obj)
+                if not text:
+                    continue
+                ts = obj.get("t")
+                if isinstance(ts, (int, float)) and ts >= 0:
+                    synced.append((int(ts), text))
+                # t:-1 或缺 t 字段 → 元信息行,不归类为 plain(留给 _is_metadata_or_placeholder)
+                continue
+
+            elrc_match = ELRC_TIMESTAMP_PATTERN.match(stripped)
+            if elrc_match:
+                minutes = int(elrc_match.group(1))
+                seconds = int(elrc_match.group(2))
+                ms_part = elrc_match.group(3).ljust(3, "0")
+                milliseconds = int(ms_part)
+                timestamp_ms = (minutes * 60 * 1000) + (seconds * 1000) + milliseconds
+                text = elrc_match.group(4).strip()
+                if text:
+                    synced.append((timestamp_ms, text))
+                continue
+
+            std_match = NORMALIZED_LRC_PATTERN.match(stripped)
+            if std_match:
+                minutes = int(std_match.group(1))
+                seconds = int(std_match.group(2))
+                ms_part = std_match.group(3).ljust(3, "0")
+                milliseconds = int(ms_part)
+                timestamp_ms = (minutes * 60 * 1000) + (seconds * 1000) + milliseconds
+                text = std_match.group(4).strip()
+                if text:
+                    synced.append((timestamp_ms, text))
+                continue
+
+            ns_match = NON_STANDARD_LRC_PATTERN.match(stripped)
+            if ns_match:
+                minutes = int(ns_match.group(1))
+                seconds = int(ns_match.group(2))
+                text = stripped[ns_match.end():].strip()
+                if text:
+                    synced.append((minutes * 60 * 1000 + seconds * 1000, text))
+                continue
+
+            plain.append(stripped)
+
+        return synced, plain
+
+    @staticmethod
+    def _extract_yrc_text(obj: dict[str, Any]) -> str:
+        """从 YRC JSON 行中提取纯文本(拼接所有 c[].tx)。"""
+        cells = obj.get("c") or []
+        parts: list[str] = []
+        for cell in cells:
+            tx = cell.get("tx") if isinstance(cell, dict) else None
+            if tx:
+                parts.append(str(tx))
+        return "".join(parts).strip()
+
+    def _is_metadata_or_placeholder(self, text: str) -> bool:
+        """判断单行歌词是否为元信息或占位文本(应被丢弃)。
+
+        元信息: "作词 : XXX" / "Lyricist: XXX" / "[00:00.00] 作词 : XXX"
+        占位:   "暂无歌词" / "纯音乐,请欣赏"
+        """
+        if not text:
+            return True
+        if _PLACEHOLDER_RE.match(text):
+            return True
+        # 元信息行通常以 "标签:" 开头;同时容忍前置时间戳 [mm:ss.xx]
+        stripped = NORMALIZED_LRC_PATTERN.sub("", text, count=1).strip()
+        if _METADATA_PREFIX_RE.match(stripped):
+            return True
+        return False
+
+    def _is_all_metadata_or_placeholder(self, text: str) -> bool:
+        """判断整段歌词是否全部由元信息/占位组成。
+
+        用于 save 之前的"双重保险":即使上游过滤漏过,也不写脏数据进数据库。
+        """
+        if not text or not text.strip():
+            return True
+        has_real_line = False
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            ts_match = NORMALIZED_LRC_PATTERN.match(stripped)
+            content = ts_match.group(4).strip() if ts_match else stripped
+            if content and not self._is_metadata_or_placeholder(content):
+                has_real_line = True
+                break
+        return not has_real_line
+
+    def _build_lrc_from_synced(self, parsed_lines: list[tuple[int, str]]) -> str:
+        """构建标准 LRC 文本(语义化封装 _build_lrc)。"""
+        return self._build_lrc(parsed_lines)
 
     def _parse_lrc(self, lrc_content: str) -> list[tuple[int, str]]:
         """解析标准化后的LRC歌词，跳过空行"""
@@ -431,38 +601,59 @@ class NeteaseMusicProvider(MetadataProvider):
 
         return self._build_lrc(merged_lines)
 
-    @staticmethod
-    def _build_plain_lyrics(lyrics: str) -> MediaItemMetadata:
-        """构建纯文本（无时间戳）歌词元数据"""
+    def _build_plain_lyrics(self, lyrics: str) -> MediaItemMetadata | None:
+        """构建纯文本（无时间戳）歌词元数据。
+
+        若全部内容都是元信息/占位文本,返回 None,避免脏数据污染数据库。
+        """
+        if self._is_all_metadata_or_placeholder(lyrics):
+            return None
         metadata = MediaItemMetadata()
         metadata.lyrics = lyrics
         return metadata
 
-    # ------------------------------------------------------------------
     # 元数据落地
-    # ------------------------------------------------------------------
     def _save_metadata_to_db(self, track: Track, metadata: MediaItemMetadata, track_name: str) -> None:
-        """将歌词写入数据库/元数据缓存"""
+        """将歌词写入数据库/元数据缓存。
+
+        写入前做"双重保险":
+          1. 字段级空检查(防止空字符串污染)
+          2. 内容级真歌词检查(防止元信息/占位文本污染)
+
+        MA 2.11.x 适配说明:
+          - 2.11 移除了 `mass.metadata.save_item_metadata`(2.10.x 用于持久化
+            非库内曲目的 provider 元数据)。现在非 library 曲目由 core 在
+            按需查询时直接消费 get_track_metadata 的返回值,无需插件落库;
+            library 曲目仍走 update_item_in_library(该 API 在 2.11 中保留)。
+          - 2.11 的 tracks._update_library_item 对 metadata 做 fill-gap 合并,
+            因此"更新已有歌词"开启时强制覆盖须携带在当前 track 对象上,
+            此处直接改写 track.metadata 后整体回写,与 core enrichment 路径一致。
+        """
         try:
             if not track.metadata:
                 track.metadata = MediaItemMetadata()
-            if metadata.lrc_lyrics:
-                track.metadata.lrc_lyrics = metadata.lrc_lyrics
-            if metadata.lyrics:
-                track.metadata.lyrics = metadata.lyrics
+
+            lrc_value = metadata.lrc_lyrics or ""
+            plain_value = metadata.lyrics or ""
+
+            lrc_value = lrc_value.strip()
+            plain_value = plain_value.strip()
+
+            if lrc_value and not self._is_all_metadata_or_placeholder(lrc_value):
+                track.metadata.lrc_lyrics = lrc_value
+            if plain_value and not self._is_all_metadata_or_placeholder(plain_value):
+                track.metadata.lyrics = plain_value
 
             if track.provider == "library":
                 self.mass.create_task(self.mass.music.tracks.update_item_in_library(track.item_id, track))
-            else:
-                save_item_metadata = getattr(self.mass.metadata, "save_item_metadata", None)
-                if save_item_metadata:
-                    self.mass.create_task(save_item_metadata(track))
+            elif hasattr(self.mass.metadata, "save_item_metadata"):
+                # MA <=2.10.x 兼容:持久化非库内曲目的 provider 元数据
+                self.mass.create_task(self.mass.metadata.save_item_metadata(track))
+            # MA 2.11.x: 非 library 曲目无需落库,core 直接使用本方法返回值
         except Exception as e:
             self.logger.error(f"[云音乐歌词插件] 歌词写入数据库失败 | 歌曲: {track_name} | 错误: {str(e)}")
 
-    # ------------------------------------------------------------------
     # 主流程
-    # ------------------------------------------------------------------
     async def get_track_metadata(self, track: Track) -> MediaItemMetadata | None:
         """获取歌曲歌词元数据"""
         self.logger.debug(
@@ -509,10 +700,15 @@ class NeteaseMusicProvider(MetadataProvider):
 
         # 所有候选都没有同步歌词时，退而求其次用纯文本歌词
         if plain_fallback:
-            self.logger.debug(f"[云音乐歌词插件] 纯文本歌词 | 歌曲: {track.name}")
             metadata = self._build_plain_lyrics(plain_fallback)
-            self._save_metadata_to_db(track, metadata, track.name)
-            return metadata
+            if metadata is None:
+                self.logger.debug(
+                    f"[云音乐歌词插件] 纯文本为元信息/占位,丢弃 | 歌曲: {track.name}"
+                )
+            else:
+                self.logger.debug(f"[云音乐歌词插件] 纯文本歌词 | 歌曲: {track.name}")
+                self._save_metadata_to_db(track, metadata, track.name)
+                return metadata
 
         self.logger.debug(f"[云音乐歌词插件] 无歌词 | 歌曲: {track.name}")
         return None

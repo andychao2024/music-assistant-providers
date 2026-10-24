@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import hashlib
 import json
 import logging
@@ -45,7 +46,7 @@ from music_assistant_models.media_items import (
     Track,
 )
 from music_assistant_models.streamdetails import StreamDetails
-from music_assistant_models.errors import LoginFailed, MusicAssistantError
+from music_assistant_models.errors import LoginFailed, MediaNotFoundError, MusicAssistantError
 from music_assistant_models.unique_list import UniqueList
 from music_assistant.models.music_provider import MusicProvider
 
@@ -62,6 +63,135 @@ if TYPE_CHECKING:
     from music_assistant.models import ProviderInstanceType
 
 LOGGER = logging.getLogger(__name__)
+
+# --------------------------------------------------------------------------- #
+# Cover image helpers (iOS artwork fix).
+#
+# lxserver relays the upstream sources' raw cover URLs, and several of them
+# (NetEase in particular) hand back http:// links. iOS blocks cleartext http
+# images in the native app (ATS / secure context), while the WebUI (served
+# over http) and Android (cleartext allowed) still render them — that is the
+# "covers missing on iOS only" bug. Upstream neteasecloudmusic provider fixed
+# this the same way: upgrade the scheme for known https-capable CDNs.
+# Verified reachable over https (2026-10-22): *.music.126.net, imge.kugou.com,
+# c1.kgimg.com, img*.kuwo.cn, y.gtimg.cn (TLS ok; 404s below are path-only).
+# --------------------------------------------------------------------------- #
+_HTTPS_IMAGE_HOST_SUFFIXES = (
+    "music.126.net",  # wy (NetEase, incl. p1..p8.music.126.net)
+    "kugou.com",  # kg
+    "kgimg.com",  # kg
+    "kuwo.cn",  # kw
+    "gtimg.cn",  # tx (QQ Music)
+    "qqimg.net",  # tx
+    "migu.cn",  # mg
+    "mimgname.com",  # mg
+)
+
+# Kuwo's CDN quirk (verified 2026-10-23). lxserver hands back two different
+# hosts for the same playlist covers: img*.kuwo.cn and img1.kwcdn.kuwo.cn.
+# Both serve identical bytes over http, but only img*.kuwo.cn answers correctly
+# on 443: img1.kwcdn.kuwo.cn sits on a shared Tencent CDN vhost whose
+# certificate is *.cdn.myqcloud.com (hostname mismatch -> the imageproxy's
+# strict TLS fails) and every request that does get through TLS comes back
+# "514 Frequency Capped" with a zero-length body.
+#
+# That host is caught by the "kuwo.cn" suffix above, so the plain http URL
+# lxserver returned was upgraded to a scheme the host cannot serve: MA could
+# not fetch the source, its imageproxy answered 404 and the WebUI rendered
+# those kuwo playlists without a cover. Rewrite the host to the kuwo origin,
+# which is a genuine superset: same bytes, valid certificate, https capable,
+# and http:// is upgraded exactly like every other host on the allow list.
+# --------------------------------------------------------------------------- #
+_KUWO_CDN_HOST_MARKER = ".kwcdn.kuwo.cn"
+_KUWO_ORIGIN_SUFFIX = ".kuwo.cn"
+
+
+def _normalize_image_url(url: str | None) -> str | None:
+    """Upgrade cover URLs to https for CDNs known to serve both schemes.
+
+    iOS blocks http images as cleartext/mixed content, so an http cover URL
+    never renders there. Hosts not on the allow list keep their original
+    scheme — upgrading a host without https would trade a broken image on
+    iOS for a broken image everywhere.
+
+    The kuwo CDN alias is handled first: it cannot serve covers over https
+    (see _KUWO_CDN_HOST_MARKER), and lxserver hands it out with a plain http
+    scheme, so a naive scheme upgrade leaves MA with an unfetchable cover.
+    Rewriting it to the kuwo origin fixes both a fresh http:// URL from the
+    server and an https:// one already stored in the MA recommendation cache.
+    """
+    if not url:
+        return url
+    stripped = url.strip()
+    if not stripped.startswith(("http://", "https://")):
+        return url
+    scheme, _, rest = stripped.partition("://")
+    authority, sep, remainder = rest.partition("/")
+    host = authority.split(":", 1)[0].lower()
+    # kuwo's CDN alias: same content on its origin, which does serve https
+    if host.endswith(_KUWO_CDN_HOST_MARKER):
+        origin = host[: -len(_KUWO_CDN_HOST_MARKER)] + _KUWO_ORIGIN_SUFFIX
+        path = f"/{remainder}" if sep else ""
+        return f"https://{origin}{path}"
+    if scheme.lower() == "http" and any(
+        host == s or host.endswith("." + s) for s in _HTTPS_IMAGE_HOST_SUFFIXES
+    ):
+        return "https://" + rest
+    return url
+
+
+def _ensure_square_image_url(url: str, size: int = 500) -> str:
+    """Append NetEase's square-size hint so thumbnails come back squared."""
+    if not url or "param=" in url:
+        return url
+    separator = "&" if "?" in url else "?"
+    return f"{url}{separator}param={size}y{size}"
+
+
+def _make_cover_image(
+    url: str | None, provider_instance: str, *, force_square: bool = False
+) -> MediaItemImage | None:
+    """Build a THUMB MediaItemImage from a raw source cover URL."""
+    if not url or not isinstance(url, str):
+        return None
+    normalized = _normalize_image_url(url.strip())
+    if not normalized or not normalized.startswith(("http://", "https://")):
+        return None
+    if force_square and "music.126.net" in normalized:
+        normalized = _ensure_square_image_url(normalized)
+    return MediaItemImage(
+        type=ImageType.THUMB,
+        path=normalized,
+        provider=provider_instance,
+        remotely_accessible=True,
+    )
+
+
+def _upgrade_stored_cover_images(item: Track | Playlist) -> bool:
+    """Upgrade stored http:// cover images on a library item, return True if changed.
+
+    Rows written by pre-1.5.0 versions hold plain http:// cover URLs (iOS blocks
+    cleartext images). MA merges image lists on update (the old entry survives at
+    the front), so the stored entry must be rewritten in place before a replace
+    (overwrite=True) write-back can clear it.
+    """
+    images = item.metadata.images if item.metadata else None
+    if not images:
+        return False
+    upgraded = False
+    new_images: UniqueList[MediaItemImage] = UniqueList()
+    for img in images:
+        if isinstance(img.path, str):
+            new_path = _normalize_image_url(img.path)
+            if new_path != img.path:
+                new_images.append(replace(img, path=new_path))
+                upgraded = True
+                continue
+        new_images.append(img)
+    if upgraded:
+        item.metadata.images = new_images
+    return upgraded
+
 
 DOMAIN = "lxmusic"
 CONF_SERVER_URL = "server_url"
@@ -308,7 +438,6 @@ def _normalize_lx_interval(value: Any) -> str:
         return ""
     if ":" in s:
         return s
-    # bare number (seconds) -> MM:SS
     try:
         total = int(float(s))
     except (TypeError, ValueError):
@@ -823,7 +952,6 @@ class LxMusicProvider(MusicProvider):
         for source in self._search_sources:
             items = await self._search_source(source, keyword, page_size=per_source)
             for item in items:
-                # tracks
                 if want_track:
                     song_id = self._item_song_id(item)
                     if song_id:
@@ -841,7 +969,6 @@ class LxMusicProvider(MusicProvider):
                         if aid in seen_artists:
                             continue
                         seen_artists.add(aid)
-                        # prefer the id seen in this search, else the cached one
                         rid = real_artist_id or self._artist_cache.get(aid, {}).get(
                             "real_id"
                         )
@@ -858,7 +985,6 @@ class LxMusicProvider(MusicProvider):
                     if aid not in seen_albums:
                         seen_albums.add(aid)
                         results.albums.append(self._register_album(source, album_name, album_id))
-            # stop once every requested type hit the limit
             if (
                 (not want_track or len(results.tracks) >= limit)
                 and (not want_artist or len(results.artists) >= limit)
@@ -877,7 +1003,6 @@ class LxMusicProvider(MusicProvider):
             if data:
                 kw = keyword.lower()
                 for pid, pname, songs in self._iter_user_playlists(data):
-                    # match the playlist name, or any track name/artist inside it
                     hit = bool(kw) and kw in (pname or "").lower()
                     if not hit:
                         for s in songs:
@@ -972,15 +1097,9 @@ class LxMusicProvider(MusicProvider):
                         )
                     },
                 )
-                if sl_img:
-                    playlist.metadata.images = [
-                        MediaItemImage(
-                            type=ImageType.THUMB,
-                            path=sl_img,
-                            provider=self.instance_id,
-                            remotely_accessible=True,
-                        )
-                    ]
+                _cover = _make_cover_image(sl_img, self.instance_id, force_square=True)
+                if _cover:
+                    playlist.metadata.images = [_cover]
                 out.append(playlist)
                 if len(out) >= limit:
                     return out
@@ -1002,7 +1121,6 @@ class LxMusicProvider(MusicProvider):
         """The real browse implementation; see the browse() docstring."""
         _P = self.instance_id
         if not path or path == f"{_P}://":
-            # top level: one BrowseFolder per section
             children: list[BrowseFolder | ItemMapping] = []
             # browse() is fully overridden, so the recommendations entry the base
             # class would add automatically has to be added here as well.
@@ -1138,16 +1256,7 @@ class LxMusicProvider(MusicProvider):
             boards = await self._collect_virtual_meta(kinds=("board",))
             for b in boards:
                 b_pic = (b.get("pic") or "").strip()
-                b_image = (
-                    MediaItemImage(
-                        type=ImageType.THUMB,
-                        path=b_pic,
-                        provider=self.instance_id,
-                        remotely_accessible=True,
-                    )
-                    if b_pic
-                    else None
-                )
+                b_image = _make_cover_image(b_pic, self.instance_id, force_square=True)
                 children.append(
                     ItemMapping(
                         media_type=MediaType.PLAYLIST,
@@ -1177,7 +1286,6 @@ class LxMusicProvider(MusicProvider):
                 LOGGER.debug("failed to fetch square playlists: %s", err)
             return children
 
-        # Unknown path: return an empty list
         return []
     # ------------------------------------------------------------------ #
     # Media item getters
@@ -1257,7 +1365,6 @@ class LxMusicProvider(MusicProvider):
         album_name = (
             info["name"] if info else (self._split_id(prov_album_id)[1] or "Unknown Album")
         )
-        # 1) fetch the full album by real albumId
         if real_id:
             try:
                 items = await self._fetch_paged(
@@ -1274,7 +1381,6 @@ class LxMusicProvider(MusicProvider):
                     return out
             except Exception as err:  # noqa: BLE001
                 LOGGER.debug("albumSongs failed %s: %s", prov_album_id, err)
-        # 2) fall back to tracks already parsed for this album, which needs no albumId
         cached = self._album_tracks.get(prov_album_id)
         if cached:
             seen_tracks: set[str] = set()
@@ -1285,7 +1391,6 @@ class LxMusicProvider(MusicProvider):
                     out.append(track)
             if out:
                 return out
-        # 3) last resort: search by album name and keep matching albums only
         out = []
         if album_name and album_name != "Unknown Album":
             try:
@@ -1364,15 +1469,9 @@ class LxMusicProvider(MusicProvider):
             # Leaderboards store their cover under "pic" and square playlists
             # under "img", so accept both keys here.
             img = (meta or {}).get("pic") or (meta or {}).get("img")
-            if img:
-                playlist.metadata.images = [
-                    MediaItemImage(
-                        type=ImageType.THUMB,
-                        path=img,
-                        provider=self.instance_id,
-                        remotely_accessible=True,
-                    )
-                ]
+            _cover = _make_cover_image(img, self.instance_id, force_square=True)
+            if _cover:
+                playlist.metadata.images = [_cover]
             return playlist
         if prov_playlist_id.startswith("sl:"):
             parts = prov_playlist_id.split(":", 2)
@@ -1426,15 +1525,9 @@ class LxMusicProvider(MusicProvider):
                 )
             },
         )
-        if meta.get("img"):
-            playlist.metadata.images = [
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=meta["img"],
-                    provider=self.instance_id,
-                    remotely_accessible=True,
-                )
-            ]
+        _cover = _make_cover_image(meta.get("img"), self.instance_id, force_square=True)
+        if _cover:
+            playlist.metadata.images = [_cover]
         return playlist
 
     async def get_playlist_tracks(
@@ -1461,13 +1554,11 @@ class LxMusicProvider(MusicProvider):
             if page > 0:
                 return []
             return await self._get_radio_tracks()
-        # Leaderboard virtual playlist
         if prov_playlist_id.startswith("list:board:"):
             parts = prov_playlist_id.split(":", 3)
             source = parts[2] if len(parts) > 2 else ""
             bangid = parts[3] if len(parts) > 3 else ""
             return await self._get_leaderboard_tracks(source, bangid, page)
-        # Square pick virtual playlist id
         if prov_playlist_id.startswith("list:songlist:"):
             parts = prov_playlist_id.split(":", 3)
             source = parts[2] if len(parts) > 2 else self._default_source
@@ -1493,7 +1584,6 @@ class LxMusicProvider(MusicProvider):
                     out.append(track)
             return out
 
-        # User playlist: prefer the cached song list
         songs = self._playlist_cache.get(prov_playlist_id)
         if songs is None:
             await self.get_playlist(prov_playlist_id)
@@ -1832,7 +1922,6 @@ class LxMusicProvider(MusicProvider):
                     pool.extend(await self._board_rows_by_name(name, source=source))
                 except Exception as err:  # noqa: BLE001
                     LOGGER.debug("lxmusic: daily board %s/%s failed: %s", source, name, err)
-            # nothing from the configured boards: retry once with fallback names
             if not pool:
                 for keyword in DAILY_FALLBACK_KEYWORDS:
                     try:
@@ -1844,7 +1933,6 @@ class LxMusicProvider(MusicProvider):
                         continue
                     if pool:
                         break
-            # still empty: hot boards from the other platforms
             if not pool:
                 for src in NEWSONG_FALLBACK_SOURCES:
                     if src == source:
@@ -1858,7 +1946,6 @@ class LxMusicProvider(MusicProvider):
                         continue
                     if pool:
                         break
-            # last resort: the server-side getDailySongs
             if not pool:
                 pool = await self._reco_daily_rows_subsonic()
 
@@ -1948,7 +2035,6 @@ class LxMusicProvider(MusicProvider):
                     pool.extend(await self._board_rows_by_name(name, source=source))
                 except Exception as err:  # noqa: BLE001
                     LOGGER.debug("lxmusic: new-song board %s/%s failed: %s", source, name, err)
-            # nothing from the configured boards: retry once with fallback names
             if not pool:
                 for keyword in NEWSONG_FALLBACK_KEYWORDS:
                     try:
@@ -1960,7 +2046,6 @@ class LxMusicProvider(MusicProvider):
                         continue
                     if pool:
                         break
-            # still empty: new-song boards from the other platforms
             if not pool:
                 for src in NEWSONG_FALLBACK_SOURCES:
                     if src == source:
@@ -1972,7 +2057,6 @@ class LxMusicProvider(MusicProvider):
                         continue
                     if pool:
                         break
-            # last resort: tracks from the newest Subsonic albums
             if not pool:
                 pool = await self._recent_album_rows()
 
@@ -2296,15 +2380,9 @@ class LxMusicProvider(MusicProvider):
         )
         if subtitle:
             playlist.metadata.description = subtitle
-        if image:
-            playlist.metadata.images = [
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=image,
-                    provider=self.instance_id,
-                    remotely_accessible=True,
-                )
-            ]
+        _cover = _make_cover_image(image, self.instance_id, force_square=True)
+        if _cover:
+            playlist.metadata.images = [_cover]
         return playlist
 
     async def _board_rows_by_name(
@@ -2473,7 +2551,6 @@ class LxMusicProvider(MusicProvider):
                 continue
             tried.add(src)
 
-            # cross-platform fallback is disabled, original source only
             actual_songmid: str | None = None
             if raw:
                 actual_songmid = (
@@ -2848,11 +2925,9 @@ class LxMusicProvider(MusicProvider):
            fields still store fine.
         """
         key = f"{source}:{song_id}"
-        # 1) fastest: raw item cached by any earlier path that resolved this track
         raw = self._raw_cache.get(key)
         if isinstance(raw, dict) and raw.get("name"):
             return dict(raw)
-        # 2) already present in the user playlist or love list cache
         data = await self._get_user_lists()
         if isinstance(data, dict):
             for _pl_id, _name, songs in self._iter_user_playlists(data):
@@ -2898,7 +2973,6 @@ class LxMusicProvider(MusicProvider):
                     continue
                 if self._item_song_id(item) == song_id and item.get("name"):
                     return dict(item)
-            # no exact id for the combined query: retry with the bare track name
             name_only = str(getattr(meta, "name", "") or "").strip()
             if name_only and name_only != keyword:
                 for item in await self._search_source(source, name_only, page_size=30):
@@ -2981,7 +3055,6 @@ class LxMusicProvider(MusicProvider):
                 continue
             item_id = f"list:{pid}"
             self._playlist_cache[item_id] = songs
-            # Use the first track's cover as the playlist cover.
             first_song = songs[0] if songs else None
             first_pic = ""
             if isinstance(first_song, dict):
@@ -3004,15 +3077,9 @@ class LxMusicProvider(MusicProvider):
                     )
                 },
             )
-            if first_pic:
-                playlist.metadata.images = [
-                    MediaItemImage(
-                        type=ImageType.THUMB,
-                        path=first_pic,
-                        provider=self.instance_id,
-                        remotely_accessible=True,
-                    )
-                ]
+            _cover = _make_cover_image(first_pic, self.instance_id, force_square=True)
+            if _cover:
+                playlist.metadata.images = [_cover]
             yield playlist
 
     def _library_item_needs_update(
@@ -3037,7 +3104,6 @@ class LxMusicProvider(MusicProvider):
         prov_name = getattr(prov_item, "name", None)
         name_differs = lib_name != prov_name
 
-        # compare covers: reduce the first thumbnail to its path
         def _first_thumb_path(item) -> str:
             meta = getattr(item, "metadata", None)
             if not meta:
@@ -3162,6 +3228,10 @@ class LxMusicProvider(MusicProvider):
 
         This override re-compares webplayer_* names after base sync and calls
         update_item_in_library(overwrite=True) on mismatches.
+
+        Also self-heals stale http:// cover images in the library for items mapped
+        to this provider (iOS blocks cleartext http images; the base sync's
+        needs-update check ignores metadata, so old rows would never be rewritten).
         """
         await super().sync_library(media_type)
         if media_type == MediaType.PLAYLIST:
@@ -3169,6 +3239,58 @@ class LxMusicProvider(MusicProvider):
                 await self._sync_webplayer_playlist_names()
             except Exception as err:  # noqa: BLE001
                 LOGGER.debug("lxmusic: webplayer name sync failed: %s", err)
+        if media_type in (MediaType.PLAYLIST, MediaType.TRACK):
+            try:
+                await self._heal_stored_cover_images(media_type)
+            except Exception as err:  # noqa: BLE001
+                LOGGER.debug("lxmusic: http cover self-heal failed: %s", err)
+
+    async def _heal_stored_cover_images(self, media_type: MediaType) -> None:
+        """Upgrade stored http:// cover URLs to https:// in this provider's library items.
+
+        New covers are built https via _make_cover_image, but rows written by older
+        plugin versions still hold http:// paths (p1-p4.music.126.net, imge.kugou.com,
+        c1.kgimg.com ...), which iOS refuses to render. Base sync never notices
+        (needs-update only compares provider mappings), so do an explicit replace:
+        upgrade the stored images and rewrite the row with overwrite=True.
+        """
+        table = "playlists" if media_type == MediaType.PLAYLIST else "tracks"
+        # get_rows_from_query appends its own LIMIT/OFFSET, so no LIMIT here
+        query = (
+            f"SELECT DISTINCT {table}.item_id AS item_id FROM {table} "
+            f"JOIN provider_mappings ON provider_mappings.item_id = {table}.item_id "
+            "AND provider_mappings.media_type = :media_type "
+            "AND provider_mappings.provider_instance = :instance "
+            # JSON-quoted prefix match: values that actually start with http://
+            f"WHERE {table}.metadata LIKE '%\"http://%'"
+        )
+        ctrl = (
+            self.mass.music.playlists
+            if media_type == MediaType.PLAYLIST
+            else self.mass.music.tracks
+        )
+        rows = await self.mass.music.database.get_rows_from_query(
+            query,
+            params={"media_type": media_type.value, "instance": self.instance_id},
+            limit=1000,
+        )
+        healed = 0
+        for row in rows:
+            db_id = int(row["item_id"])
+            try:
+                item = await ctrl.get_library_item(db_id)
+            except MediaNotFoundError:
+                continue
+            if not _upgrade_stored_cover_images(item):
+                continue
+            await ctrl.update_item_in_library(db_id, item, overwrite=True)
+            healed += 1
+        if healed:
+            LOGGER.info(
+                "lxmusic: upgraded %d stored http:// cover image(s) to https:// (%s)",
+                healed,
+                media_type.value,
+            )
 
     async def _sync_webplayer_playlist_names(self) -> None:
         """Compare LX server userList webplayer_* playlists, update MA DB name on mismatch.
@@ -3301,7 +3423,6 @@ class LxMusicProvider(MusicProvider):
             except Exception as err:  # noqa: BLE001
                 LOGGER.debug("artistAlbums failed %s: %s", prov_artist_id, err)
         if not albums:
-            # fallback: search by artist name and group the hits by album name
             seen_albums: set[str] = set()
             for src in self._search_sources:
                 items = await self._search_source(src, name, page_size=30)
@@ -3342,7 +3463,6 @@ class LxMusicProvider(MusicProvider):
             except Exception as err:  # noqa: BLE001
                 LOGGER.debug("artistSongs failed %s: %s", prov_artist_id, err)
         if not tracks:
-            # fallback: search by artist name and keep matching artists only
             for src in self._search_sources:
                 items = await self._search_source(src, name, page_size=30)
                 for item in items:
@@ -3353,7 +3473,6 @@ class LxMusicProvider(MusicProvider):
                             tracks.append(track)
                 if len(tracks) >= 20:
                     break
-        # dedupe
         seen: set[str] = set()
         out: list[Track] = []
         for track in tracks:
@@ -3987,7 +4106,6 @@ class LxMusicProvider(MusicProvider):
                     skipped_keys.add(key)
                     skipped_empty.append((j["bangid"], j["bname"]))
                     continue
-                # cover from the first track, preferring item.pic or al.picUrl
                 first = items[0]
                 if isinstance(first, dict):
                     pic = (
@@ -3999,7 +4117,6 @@ class LxMusicProvider(MusicProvider):
                     if pic:
                         board_pic_map[key] = pic
 
-        # drop boards that came back empty
         if skipped_empty:
             LOGGER.info(
                 "lxmusic: skipped %d empty boards (empty list or 500): %s",
@@ -4114,7 +4231,6 @@ class LxMusicProvider(MusicProvider):
         """
         page_size = 36  # the server hardcodes 36 per page and ignores limit
 
-        # first page: total plus the starting batch
         first_resp = await self._request(
             "GET",
             "/api/music/songList/list",
@@ -4132,7 +4248,6 @@ class LxMusicProvider(MusicProvider):
             except (TypeError, ValueError):
                 server_total = 0
 
-        # estimate the page count from the reported total, with a cap
         if server_total > 0:
             max_pages = min((server_total // page_size) + 2, 50)
         else:
@@ -4140,7 +4255,6 @@ class LxMusicProvider(MusicProvider):
 
         all_lists: list[dict[str, Any]] = list(first_lists)
 
-        # fetch the remaining pages sequentially
         for p in range(2, max_pages + 1):
             page_lists: list[dict[str, Any]] = []
             for retry in range(3):
@@ -4198,16 +4312,7 @@ class LxMusicProvider(MusicProvider):
                 "total": sl_total,
             }
             sl_img = (self._square_meta[sl_item_id].get("img") or "").strip()
-            sl_image = (
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=sl_img,
-                    provider=self.instance_id,
-                    remotely_accessible=True,
-                )
-                if sl_img
-                else None
-            )
+            sl_image = _make_cover_image(sl_img, self.instance_id, force_square=True)
             out.append(
                 ItemMapping(
                     media_type=MediaType.PLAYLIST,
@@ -4217,7 +4322,6 @@ class LxMusicProvider(MusicProvider):
                     image=sl_image,
                 )
             )
-        # sort by track count and keep the top slice
         out.sort(
             key=lambda im: self._square_meta.get(im.item_id, {}).get("total", 0),
             reverse=True,
@@ -4289,16 +4393,7 @@ class LxMusicProvider(MusicProvider):
                 ),
             }
             sl_img = (self._square_meta[sl_item_id].get("img") or "").strip()
-            sl_image = (
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=sl_img,
-                    provider=self.instance_id,
-                    remotely_accessible=True,
-                )
-                if sl_img
-                else None
-            )
+            sl_image = _make_cover_image(sl_img, self.instance_id, force_square=True)
             out.append(
                 ItemMapping(
                     media_type=MediaType.PLAYLIST,
@@ -4342,7 +4437,6 @@ class LxMusicProvider(MusicProvider):
         ):
             lst = data.get(key)
             if isinstance(lst, list):
-                # a bare song array, wrap it as a virtual playlist
                 out.append((virtual_id, virtual_name, lst))
             elif isinstance(lst, dict):
                 # older servers may still nest {id, name, list}
@@ -4397,7 +4491,6 @@ class LxMusicProvider(MusicProvider):
         2) the URL suffix, such as .flac, .mp3, .m4a, .ogg or .opus
         3) MP3 as the default, which is correct for the 128k and 320k tiers
         """
-        # first: the type field in the server response
         type_hint = ""
         if isinstance(result, dict):
             for container in (result, result.get("data") if isinstance(result.get("data"), dict) else {}):
@@ -4419,7 +4512,6 @@ class LxMusicProvider(MusicProvider):
         if type_hint == "opus":
             return ContentType.OPUS
 
-        # second: the URL suffix
         u = (url or "").lower().split("?", 1)[0]
         if u.endswith(".flac"):
             return ContentType.FLAC
@@ -4434,7 +4526,6 @@ class LxMusicProvider(MusicProvider):
         if u.endswith(".mp3"):
             return ContentType.MP3
 
-        # final default
         return ContentType.MP3
 
     @staticmethod
@@ -4450,7 +4541,6 @@ class LxMusicProvider(MusicProvider):
         - none of the above: the platform default, preferring flac since
           highest-quality settings usually return it
         """
-        # 1) single type value
         t = item.get("type")
         if isinstance(t, str) and t:
             tl = t.lower()
@@ -4465,11 +4555,9 @@ class LxMusicProvider(MusicProvider):
             if "opus" in tl:
                 return ContentType.OPUS
 
-        # 2) list of available qualities
         for key in ("types", "qualities", "_quality", "qualityList"):
             arr = item.get(key)
             if isinstance(arr, list) and arr:
-                # prefer flac when offered
                 for q in arr:
                     if isinstance(q, str) and "flac" in q.lower():
                         return ContentType.FLAC
@@ -4478,7 +4566,6 @@ class LxMusicProvider(MusicProvider):
                         return ContentType.MP3
                 break
 
-        # 3) a lone quality field
         q = item.get("quality") or item.get("_quality")
         if isinstance(q, str) and q:
             ql = q.lower()
@@ -4489,7 +4576,6 @@ class LxMusicProvider(MusicProvider):
             if "m4a" in ql or "aac" in ql:
                 return ContentType.M4A
 
-        # 4) preview URL suffix
         for key in ("previewUrl", "preview_url", "trialUrl", "_preview"):
             val = item.get(key)
             if isinstance(val, str) and val:
@@ -4508,7 +4594,6 @@ class LxMusicProvider(MusicProvider):
                     return ContentType.MP3
                 break
 
-        # 5) infer the platform default, preferring flac when the server is set to highest quality
         source_default_flac = {
             "kw", "kg", "tx", "wy", "qq", "netease", "163", "mg",
         }
@@ -4615,15 +4700,9 @@ class LxMusicProvider(MusicProvider):
             self._album_tracks[album_aid].append(track)
 
         pic = item.get("img") or item.get("pic") or item.get("image") or item.get("cover")
-        if pic:
-            track.metadata.images = [
-                MediaItemImage(
-                    type=ImageType.THUMB,
-                    path=pic,
-                    provider=self.instance_id,
-                    remotely_accessible=True,
-                )
-            ]
+        _cover = _make_cover_image(pic, self.instance_id, force_square=True)
+        if _cover:
+            track.metadata.images = [_cover]
         # cache the Track and its raw item for get_track / get_stream_details
         if hasattr(self, "_track_cache"):
             self._track_cache[track.item_id] = track
@@ -4652,7 +4731,6 @@ class LxMusicProvider(MusicProvider):
             if cached_lrc:
                 self._set_track_lrc(track, cached_lrc)
             return
-        # cache miss: ask the server
         raw_item = raw if raw is not None else self._raw_cache.get(cache_key)
         try:
             lrc = await self._fetch_lyrics(cache_key, raw=raw_item)
@@ -4885,7 +4963,6 @@ class LxMusicProvider(MusicProvider):
                     )
                     if not pic and not aname:
                         continue
-                    # duration check
                     hit_interval = hit.get("interval") or hit.get("duration") or ""
                     hit_seconds = self._parse_duration(str(hit_interval)) if hit_interval else 0
                     interval_ok = (
@@ -4905,7 +4982,6 @@ class LxMusicProvider(MusicProvider):
                         # duration differs but the cover is usable as a fallback
                         if not fallback_pic and pic:
                             fallback_pic = pic
-                # write back in place
                 if need_pic:
                     final_pic = picked_pic or fallback_pic
                     if final_pic:

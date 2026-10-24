@@ -6,8 +6,8 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING, Any, cast
 from datetime import datetime
 import re
 
@@ -20,6 +20,8 @@ from music_assistant_models.enums import (
     ExternalID,
     ImageType,
     ProviderFeature,
+    SortDirection,
+    SortField,
 )
 from music_assistant_models.media_items import (
     Album,
@@ -46,7 +48,6 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models import ProviderInstanceType
 
-# 常量定义
 SUPPORTED_FEATURES: set[ProviderFeature] = {
     ProviderFeature.ARTIST_METADATA,
     ProviderFeature.ALBUM_METADATA,
@@ -60,7 +61,6 @@ class ConfigKeys:
     ENABLE_IMAGES = "enable_images"
     API_URL = "api_url"
 
-# 一键动作
 ACTION_TRIGGER_SCAN = "trigger_scan_missing_artist_metadata"
 ACTION_TRIGGER_SCAN_ALL = "trigger_scan_all_artist_metadata"
 ACTION_TRIGGER_SCAN_ALL_TRACKS = "trigger_scan_all_track_metadata"
@@ -75,12 +75,10 @@ SCAN_ALL_TASK_ID = "netease_metadata_scan_all_artists_v2"
 # 插件自定义的"扫描全部歌曲元数据"任务 ID
 SCAN_ALL_TRACKS_TASK_ID = "netease_metadata_scan_all_tracks_v2"
 
-# 正则表达式
 import re
 SOUNDTRACK_SUFFIX_PATTERN = re.compile(r'\s*(电视原声带|电影原声带|原声大碟|OST|Original Soundtrack)\s*', re.IGNORECASE)
 COMMON_SUFFIX_PATTERN = re.compile(r'\s*\([^)]*\)|\s*\[[^]]*\]|\s*-\s*.*$')
 
-# 配置参数
 ARTIST_NAME_SEPARATORS = ['/', '\\', '|', ',', '；', ';', '+']
 CACHE_TTL = 86400 * 7
 # 实测 NCP Enhanced v4.40.1 + 网易云 API 阈值：
@@ -92,7 +90,6 @@ API_RATE_PERIOD = 1
 ALBUM_IMAGE_PARAM = "?param=500y500"
 EMPTY_RESULT_MARKER = {"_empty_result": True}  # 标记"API 通了但无结果"，区别于 API 失败返回的 None
 
-# 数据模型定义
 @dataclass
 class CloudMusicArtistDetail(DataClassDictMixin):
     id: int
@@ -132,7 +129,6 @@ class CloudMusicTrack(DataClassDictMixin):
     genre: str | None = None
     description: str | None = None
 
-# 工具函数
 def clean_artist_name(artist_name: str | None) -> str:
     if not artist_name:
         return ""
@@ -154,9 +150,59 @@ def parse_timestamp(timestamp_ms: int | None) -> int | None:
     except (ValueError, TypeError):
         return None
 
+# iOS 客户端屏蔽明文 http 图片(ATS/混合内容),WebUI/Android 正常。
+# 与 lxmusic 插件 _HTTPS_IMAGE_HOST_SUFFIXES 保持一致(均已验证 https 可达)。
+_HTTPS_IMAGE_HOST_SUFFIXES = (
+    "music.126.net",
+    "kugou.com",
+    "kgimg.com",
+    "kuwo.cn",
+    "gtimg.cn",
+    "qqimg.net",
+    "migu.cn",
+    "mimgname.com",
+)
+
+
+def normalize_image_url(pic_url: str | None) -> str | None:
+    """把白名单图床的 http:// 封面升级为 https://(iOS 屏蔽明文 http 图片)。"""
+    if not pic_url or not pic_url.startswith("http://"):
+        return pic_url
+    rest = pic_url[len("http://"):]
+    host = rest.split("/", 1)[0].split(":", 1)[0].lower()
+    if any(host == s or host.endswith("." + s) for s in _HTTPS_IMAGE_HOST_SUFFIXES):
+        return "https://" + rest
+    return pic_url
+
+
+def _upgrade_stored_images(item: Any) -> bool:
+    """把库内条目已存封面里的白名单 http:// 升级为 https://,返回是否改动。
+
+    iOS 屏蔽明文 http 图片;存量行里的旧封面在"刮削所有艺术家/歌曲"扫描时
+    顺带升级,并经 update_item_in_library(overwrite=True) 整体替换落库,
+    旧 http 条目不会残留(merge 路径会保留旧条目,overwrite 才会清除)。
+    """
+    images = item.metadata.images if (item is not None and item.metadata) else None
+    if not images:
+        return False
+    upgraded = False
+    new_images: UniqueList = UniqueList()
+    for img in images:
+        new_path = normalize_image_url(img.path) if isinstance(img.path, str) else img.path
+        if new_path != img.path:
+            new_images.append(replace(img, path=new_path))
+            upgraded = True
+        else:
+            new_images.append(img)
+    if upgraded:
+        item.metadata.images = new_images
+    return upgraded
+
+
 def fix_album_image_url(pic_url: str | None) -> str | None:
     if not pic_url:
         return None
+    pic_url = normalize_image_url(pic_url)
     if ALBUM_IMAGE_PARAM not in pic_url:
         return f"{pic_url}{ALBUM_IMAGE_PARAM}"
     return pic_url
@@ -187,7 +233,6 @@ def calculate_album_match_score(target_name: str, candidate_name: str, target_ar
     
     return min(score, 100.0)
 
-# 核心Provider类
 class CloudMusicMetadataProvider(MetadataProvider):
     throttler: ThrottlerManager
     
@@ -265,12 +310,23 @@ class CloudMusicMetadataProvider(MetadataProvider):
         """处理 provider 设置页中的按钮点击"""
         # 所有按钮统一返回提示文案（hermes-studio 前端把 message 渲染为 toast）
         if action == ACTION_TRIGGER_SCAN:
-            self.logger.debug("[云音乐元数据] 触发 Scan missing artist metadata 任务")
-            self.mass.tasks.run_background_task(
-                task_id=SCAN_TASK_ID,
-                name="Scan missing artist metadata",
-                handler=self.mass.metadata._scan_missing_artist_metadata,
-            )
+            self.logger.debug("[云音乐元数据] 触发 Scan missing metadata 任务")
+            # MA 2.11: 该任务 id 已由 core 以调度任务形式注册,run_task 直接入队,
+            # 避免 run_background_task 用同 id 抢占/替换 core 的每日扫描任务;
+            # 2.10.x 无此入口时回退为手动后台任务。
+            try:
+                self.mass.tasks.run_task(SCAN_TASK_ID)
+            except Exception:
+                # run_task 不可用(<=2.10)或该调度任务被禁用时用后台任务兜底;
+                # 2.11 用独立 id,避免 run_background_task 抢占 core 的同 id 调度任务
+                handler = getattr(
+                    self.mass.metadata, "_scan_missing_metadata", None
+                ) or getattr(self.mass.metadata, "_scan_missing_artist_metadata")
+                self.mass.tasks.run_background_task(
+                    task_id=f"{SCAN_TASK_ID}_manual",
+                    name="Scan missing metadata",
+                    handler=handler,
+                )
             return ConfigActionResult(message=TASK_STARTED_HINT)
         if action == ACTION_TRIGGER_SCAN_ALL:
             self.logger.debug("[云音乐元数据] 触发扫描全部艺术家任务")
@@ -306,7 +362,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
         if not self.api_url:
             self.logger.error("[云音乐元数据] API地址未配置，插件将无法正常工作")
         else:
-            self.logger.info("[云音乐元数据] v2.0 初始化完成")
+            self.logger.info("[云音乐元数据] v2.2 初始化完成（适配 MA 2.11.x；扫描时自愈 http 封面）")
 
     async def get_artist_metadata(self, artist: Artist) -> MediaItemMetadata | None:
         self.logger.debug("[网易云] get_artist_metadata 被调用: %s", artist.name)
@@ -559,6 +615,18 @@ class CloudMusicMetadataProvider(MetadataProvider):
             self.logger.exception("[云音乐元数据] 歌曲元数据获取失败: %s", search_keyword)
             return None
 
+    @staticmethod
+    async def _resolve_artist(artists_ctrl, item: ItemMapping) -> Artist:
+        """ItemMapping → 完整 Artist(兼容两个版本的方法签名)。
+
+        MA 2.11.x: artist_from_item_mapping 是同步方法;
+        MA 2.10.x: 同名方法是 async 的。返回协程时 await 取回结果。
+        """
+        resolved = artists_ctrl.artist_from_item_mapping(item)
+        if asyncio.iscoroutine(resolved):
+            return await cast("Any", resolved)
+        return cast("Artist", resolved)
+
     def _has_valid_artist_images(self, artist: Artist) -> bool:
         if not self.enable_images:
             return False
@@ -585,7 +653,9 @@ class CloudMusicMetadataProvider(MetadataProvider):
                 batch = await controller.get_library_items_by_query(
                     limit=page_size,
                     offset=offset,
-                    order_by="sort_name",
+                    # MA 2.11: order_by(str) → sort_field(SortField) + sort_direction
+                    sort_field=SortField.SORT_NAME,
+                    sort_direction=SortDirection.ASC,
                     collapse_collections=False,
                 )
             except Exception as err:
@@ -625,18 +695,31 @@ class CloudMusicMetadataProvider(MetadataProvider):
 
         total = len(all_artists)
         update_current_task_progress_text(f"共 {total} 位艺术家，开始强制刷新...")
+        healed = 0
         for index, artist in enumerate(all_artists, 1):
             try:
                 update_current_task_progress_from_index(
                     index, total, f"刷新艺术家 {index}/{total}: {artist.name}",
                 )
                 if isinstance(artist, ItemMapping):
-                    artist = await artists_ctrl.artist_from_item_mapping(artist)
+                    artist = await self._resolve_artist(artist, artists_ctrl)
+                # 存量封面自愈:库里早期写入的是 http:// 封面(iOS 屏蔽明文 http 图片,
+                # WebUI/Android 正常)。MA 落库对 images 是 merge(旧条目保留在首位),
+                # 所以先把库里已存封面升级为 https:// 并用 overwrite=True 整体替换落库
+                # (完整 DB 对象写回,不会丢失其余元数据),之后 force_refresh 的 merge
+                # 产生的新条目与升级后 path 相同,merge_lists 去重,旧 http 不再残留。
+                if _upgrade_stored_images(artist):
+                    healed += 1
+                    await artists_ctrl.update_item_in_library(
+                        artist.item_id, artist, overwrite=True
+                    )
                 await self.mass.metadata._update_artist_metadata(artist, force_refresh=True)
             except Exception as err:
                 report_current_task_failure(f"{artist.name}: {err}")
                 self.logger.warning("[云音乐元数据] 刷新艺术家 %s 失败: %s", artist.name, err)
-        update_current_task_progress_text(f"全部 {total} 位艺术家刷新完成")
+        update_current_task_progress_text(
+            f"全部 {total} 位艺术家刷新完成（存量封面升级 https: {healed}）"
+        )
         return None
 
     async def _scan_all_track_metadata(self) -> None:
@@ -662,16 +745,26 @@ class CloudMusicMetadataProvider(MetadataProvider):
 
         total = len(all_tracks)
         update_current_task_progress_text(f"共 {total} 首歌曲，开始强制刷新...")
+        healed = 0
         for index, track in enumerate(all_tracks, 1):
             try:
                 update_current_task_progress_from_index(
                     index, total, f"刷新歌曲 {index}/{total}: {track.name}",
                 )
+                # 存量封面自愈,同艺术家扫描:升级库里 http:// 封面为 https:// 后
+                # overwrite=True 整体替换落库(完整 DB 对象写回,专辑/艺人关系不变)
+                if _upgrade_stored_images(track):
+                    healed += 1
+                    await tracks_ctrl.update_item_in_library(
+                        track.item_id, track, overwrite=True
+                    )
                 await self.mass.metadata._update_track_metadata(track, force_refresh=True)
             except Exception as err:
                 report_current_task_failure(f"{track.name}: {err}")
                 self.logger.warning("[云音乐元数据] 刷新歌曲 %s 失败: %s", track.name, err)
-        update_current_task_progress_text(f"全部 {total} 首歌曲刷新完成")
+        update_current_task_progress_text(
+            f"全部 {total} 首歌曲刷新完成（存量封面升级 https: {healed}）"
+        )
         return None
 
     @use_cache(CACHE_TTL, persistent=True, cache_none=True)
@@ -727,7 +820,7 @@ class CloudMusicMetadataProvider(MetadataProvider):
                 pic_url = artist_search.picUrl
             if pic_url:
                 metadata.images.append(
-                    MediaItemImage(type=ImageType.THUMB, path=pic_url, provider=self.instance_id, remotely_accessible=True)
+                    MediaItemImage(type=ImageType.THUMB, path=normalize_image_url(pic_url), provider=self.instance_id, remotely_accessible=True)
                 )
         
         mbid = artist_detail.musicBrainzId if use_detail else artist_search.musicBrainzId
@@ -762,7 +855,6 @@ class CloudMusicMetadataProvider(MetadataProvider):
         
         return metadata
 
-# 插件初始化
 async def setup(
     mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
 ) -> ProviderInstanceType:
