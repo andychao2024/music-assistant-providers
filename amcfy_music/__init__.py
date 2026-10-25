@@ -4,7 +4,7 @@ Amcfy Music Subsonic Bridge Plugin for Music Assistant.
 Subsonic API bridge for Amcfy Music client - browse and stream all MA music
 sources (local files, Spotify, Tidal, NetEase, etc.) via Subsonic protocol.
 Compatible with Music Assistant 2.10.x and 2.11.x.
-v1.3.6
+v1.3.7
 """
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import aiohttp
 from aiohttp import web
 
+from music_assistant.controllers.webserver.helpers.auth_middleware import set_current_user
 from music_assistant.helpers.audio import get_mime_type
 from music_assistant.helpers.images import get_image_data
 from music_assistant.models import ProviderInstanceType
@@ -70,6 +71,8 @@ ENDPOINT_MAP: dict[str, str] = {
     "search2": "handle_search2",
     "search3": "handle_search3",
     "getRandomSongs": "handle_random_songs",
+    "getArtistList": "handle_get_artist_list",
+    "getNowPlaying": "handle_get_now_playing",
     "getSongsByGenre": "handle_songs_by_genre",
     "getGenres": "handle_get_genres",
     "getCoverArt": "handle_get_cover_art",
@@ -108,6 +111,14 @@ PLACEHOLDER_PNG = (
 )
 CORS_HEADERS = {"Access-Control-Allow-Origin": "*"}
 AUDIO_EXTS = frozenset({".mp3", ".flac", ".wav", ".ogg", ".opus", ".aac", ".m4a", ".wma", ".aiff", ".alac", ".dsf", ".dff"})
+
+
+def _lib_numeric_id(d: dict) -> str:
+    """从响应字典的 id(library://album/123 或裸 item_id)提取数字库 id。"""
+    raw = str(d.get("id", ""))
+    if "/" in raw:
+        raw = raw.rsplit("/", 1)[-1]
+    return raw
 
 
 def _safe_int(val, default=0):
@@ -197,6 +208,24 @@ def _format_timestamp(ts: int | float | datetime | None) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _ts_opt(ts: int | float | datetime | None) -> str | None:
+    """OpenSubsonic 可省略时间戳:0/None 返回 None(响应里整个字段消失)。"""
+    if not ts:
+        return None
+    return _format_timestamp(ts)
+
+
+def _st(obj) -> dict:
+    """读取 _attach_stats 挂到对象上的只读播放/收藏统计。
+
+    MA 2.11 的 Album/Artist/Playlist 数据模型只有 favorite/date_added,
+    不带 play_count/last_played/favorite_timestamp,但箭头音乐的
+    "播放最多/最近播放/最近喜爱"卡片靠响应里的 playCount/played/starred
+    字段本地排序,所以列表 handler 先用 _attach_stats 从库回填。
+    """
+    return getattr(obj, "_amcfy_stats", None) or {}
+
+
 def _find_image_id(item: Track | Album | Artist) -> str:
     images = (item.metadata and item.metadata.images) or []
     for img in images:
@@ -276,7 +305,8 @@ def _song_dict(track: Track) -> dict:
     year = (album and album.year) or ""
     if not year and track.metadata and track.metadata.release_date:
         year = track.metadata.release_date.year
-    return {
+    st = _st(track)
+    d = {
         "id": track.uri or track.item_id,
         "parent": album.uri if album else "",
         "title": track.name,
@@ -294,8 +324,7 @@ def _song_dict(track: Track) -> dict:
         "discNumber": track.disc_number or 0,
         "type": "music",
         "created": _format_timestamp(track.date_added),
-        "played": _format_timestamp(track.last_played) if getattr(track, "last_played", None) else None,
-        "starred": _format_timestamp(track.date_added) if track.favorite else None,
+        "played": _ts_opt(st.get("last_played") or getattr(track, "last_played", None)),
         "albumId": album.uri if album else "",
         "artistId": artist.uri if artist else "",
         "genre": next(iter(genres), "") if genres else "",
@@ -304,6 +333,15 @@ def _song_dict(track: Track) -> dict:
         "samplingRate": sample_rate,
         "channelCount": channels,
     }
+    # v1.3.7: starred 输出收藏时间(favorites.timestamp,OpenSubsonic 语义),
+    # 而不是入库时间,箭头音乐"最近喜爱的歌曲"按 starred 排序才有意义。
+    if track.favorite:
+        d["starred"] = _ts_opt(st.get("fav_ts") or track.date_added)
+    # OpenSubsonic 扩展字段:箭头音乐会在本地按 playCount 排"播放最多"等卡片,
+    # 缺字段时全按 0 排导致乱序。数值从库只读回填,见 _attach_stats。
+    if st.get("play_count"):
+        d["playCount"] = st["play_count"]
+    return d
 
 
 def _album_dict(album: Album, track_count: int = 0, duration: int = 0) -> dict:
@@ -311,7 +349,8 @@ def _album_dict(album: Album, track_count: int = 0, duration: int = 0) -> dict:
     genres = album.metadata and album.metadata.genres
     if genres and isinstance(genres, str):
         genres = [genres]
-    return {
+    st = _st(album)
+    d = {
         "id": album.uri or album.item_id,
         "name": album.name,
         "artist": artist.name if artist else "Unknown",
@@ -320,21 +359,37 @@ def _album_dict(album: Album, track_count: int = 0, duration: int = 0) -> dict:
         "songCount": track_count,
         "duration": duration,
         "created": _format_timestamp(album.date_added),
-        "played": _format_timestamp(album.last_played) if getattr(album, "last_played", None) else None,
+        "played": _ts_opt(st.get("last_played")),
         "year": album.year or 0,
         "genre": next(iter(genres), "") if genres else "",
-        "starred": _format_timestamp(album.date_added) if album.favorite else None,
     }
+    # v1.3.7: 模型不携带 play_count/last_played/收藏时间,全部从 DB 只读 stats 补,
+    # 否则 frequent/recent/starred 卡片全是 0 分乱序。
+    if album.favorite:
+        d["starred"] = _ts_opt(st.get("fav_ts") or album.date_added)
+    if st.get("play_count"):
+        d["playCount"] = st["play_count"]
+    return d
 
 
-def _artist_dict(artist: Artist, album_count: int = 0) -> dict:
-    return {
+def _artist_dict(artist: Artist, album_count: int = 0, track_count: int = 0) -> dict:
+    st = _st(artist)
+    d = {
         "id": artist.uri or artist.item_id,
         "name": artist.name,
         "albumCount": album_count,
         "coverArt": _find_image_id(artist),
-        "starred": _format_timestamp(artist.date_added) if artist.favorite else None,
     }
+    if track_count:
+        # "歌曲最多的艺术家"卡片:客户端按 songCount 本地排序
+        d["songCount"] = track_count
+    if artist.favorite:
+        d["starred"] = _ts_opt(st.get("fav_ts") or artist.date_added)
+    if st.get("play_count"):
+        d["playCount"] = st["play_count"]
+    if st.get("last_played"):
+        d["played"] = _ts_opt(st["last_played"])
+    return d
 
 
 def _build_index(artist_dicts: list[dict]) -> list[dict]:
@@ -686,11 +741,37 @@ class AmcfyBridgePlugin(PluginProvider):
         if not handler:
             return self._error(0, f"Not implemented: {endpoint}")
 
+        # v1.3.7: MA 2.11 把收藏(favorites)按 user 隔离,library_items(favorite=True)
+        # 与 item.favorite 子查询都绑定 "current user"(ContextVar)。本插件是自建
+        # HTTP 路由,不走 webserver auth 中间件,contextvar 为空 → 收藏查询恒空、
+        # star/unstar/scrobble 也写不到正确用户名下。这里按 Subsonic u= 参数解析
+        # MA 用户(admin 角色兜底)并注入 current_user。
+        await self._bind_user_context(params)
+
         try:
             return await handler(request, params)
         except Exception as e:
             self.logger.debug("Error handling %s: %s", endpoint, e)
             return self._error(0, str(e)[:200])
+
+    async def _bind_user_context(self, params: dict[str, str]) -> None:
+        user = None
+        try:
+            users = await self.mass.webserver.auth.list_users()
+            sub_user = (params.get("u") or "").strip().lower()
+            by_name = {u.username.lower(): u for u in users}
+            if sub_user in by_name:
+                user = by_name[sub_user]
+            elif not user:
+                admins = [u for u in users if u.role == "admin"]
+                user = admins[0] if admins else (users[0] if users else None)
+        except Exception as e:
+            self.logger.debug("resolve MA user failed: %s", e)
+        set_current_user(user)
+        if self.config.get_value(CONF_DEBUG_VERBOSE):
+            self.logger.debug(
+                "Bound user context: subsonic_u=%r → ma_user=%r",
+                params.get("u"), user.username if user else None)
 
     async def handle_ping(self, request: web.Request, params: dict[str, str]) -> web.Response:
         return self._respond()
@@ -723,12 +804,188 @@ class AmcfyBridgePlugin(PluginProvider):
             pass
         return counts
 
+    async def _attach_stats(self, items: list, table: str) -> None:
+        """只读批量回填 play_count/last_played/收藏时间,挂到 item._amcfy_stats。
+
+        MA 2.11 模型里 Album/Artist/Playlist 完全不携带这些字段(Track 仅
+        last_played),而箭头音乐卡片靠响应里的 playCount/played/starred
+        本地排序,必须从 library.db 只读补数。经 MA 自带连接执行,
+        不做任何写操作。
+        """
+        ids: list[int] = []
+        keys: list[str | None] = []
+        for it in items:
+            raw = str(getattr(it, "uri", "") or "") or str(getattr(it, "item_id", ""))
+            nid = raw.rsplit("/", 1)[-1] if "/" in raw else raw
+            if nid.isdigit():
+                ids.append(int(nid))
+                keys.append(raw)
+            else:
+                keys.append(None)
+        if not ids:
+            return
+        stats: dict[int, dict] = {}
+        db = self.mass.music.database
+        try:
+            rows = await db.get_rows_from_query(
+                f"SELECT item_id, play_count, last_played FROM {table} "
+                "WHERE item_id IN :ids",
+                {"ids": ids}, limit=0)
+            for r in rows:
+                stats[int(r["item_id"])] = {
+                    "play_count": int(r["play_count"] or 0),
+                    "last_played": float(r["last_played"] or 0),
+                }
+        except Exception as e:
+            self.logger.debug("attach_stats(%s) play data failed: %r", table, e)
+        try:
+            rows = await db.get_rows_from_query(
+                "SELECT item_id, timestamp FROM favorites "
+                "WHERE favorite=1 AND media_type=:mt AND item_id IN :ids",
+                {"mt": table.rstrip("s"), "ids": ids}, limit=0)
+            for r in rows:
+                stats.setdefault(int(r["item_id"]), {})["fav_ts"] = float(r["timestamp"] or 0)
+        except Exception as e:
+            self.logger.debug("attach_stats(%s) favorites failed: %r", table, e)
+        for it, key in zip(items, keys):
+            if not key or not key.rsplit("/", 1)[-1].isdigit():
+                continue
+            st = stats.get(int(key.rsplit("/", 1)[-1]))
+            if st:
+                try:
+                    it._amcfy_stats = st
+                except Exception:
+                    pass
+
+    async def _album_track_counts_map(self, album_ids: list[str] | None = None) -> dict[str, tuple[int, int]]:
+        """只读 SQL 统计每专辑 (曲目数, 总时长)。album_tracks 是 MA 2.11 的关联表。"""
+        try:
+            where = ""
+            qp: dict | None = None
+            if album_ids:
+                ids = [int(i) for i in album_ids if str(i).isdigit()]
+                if ids:
+                    where = "WHERE at.album_id IN :ids"
+                    qp = {"ids": ids}
+                else:
+                    return {}
+            rows = await self.mass.music.database.get_rows_from_query(
+                "SELECT at.album_id AS album_id, COUNT(at.track_id) AS cnt, "
+                "COALESCE(SUM(t.duration), 0) AS dur "
+                "FROM album_tracks at JOIN tracks t ON t.item_id = at.track_id "
+                f"{where} GROUP BY at.album_id",
+                qp, limit=0)
+            return {str(r["album_id"]): (int(r["cnt"] or 0), int(r["dur"] or 0)) for r in rows}
+        except Exception as e:
+            self.logger.debug("album_track_counts failed: %r", e)
+            return {}
+
+    async def _ordered_library_items(self, controller, order_by: str | None, **kw) -> list:
+        """带排序取库列表;字段不被该 listing 支持时(2.11 会抛 InvalidDataError)
+        回退无排序,保证卡片永远有数据。"""
+        if order_by:
+            try:
+                return await controller.library_items(order_by=order_by, **kw)
+            except Exception as e:
+                self.logger.debug("order_by=%r rejected, fallback unsorted: %r", order_by, e)
+        return await controller.library_items(**kw)
+
+    async def _artist_track_counts_map(self) -> dict[str, int]:
+        """只读 SQL 统计每个关联艺术家的歌曲数(track_artists 关联表)。"""
+        try:
+            rows = await self.mass.music.database.get_rows_from_query(
+                "SELECT artist_id, COUNT(DISTINCT track_id) AS cnt "
+                "FROM track_artists GROUP BY artist_id", None, limit=0)
+            return {str(r["artist_id"]): int(r["cnt"] or 0) for r in rows}
+        except Exception as e:
+            self.logger.debug("artist_track_counts failed: %r", e)
+            return {}
+
     async def handle_get_artists(self, request: web.Request, params: dict[str, str]) -> web.Response:
         artists = await self.mass.music.artists.library_items(limit=LIBRARY_MAX)
         album_counts = await self._get_album_count_map()
-        indexed = _build_index([_artist_dict(a, album_counts.get(a.uri or a.item_id, 0)) for a in artists])
+        artist_track_counts = await self._artist_track_counts_map()
+        await self._attach_stats(artists, "artists")
+        indexed = _build_index([
+            _artist_dict(a, album_counts.get(a.uri or a.item_id, 0),
+                         artist_track_counts.get(_lib_numeric_id({"id": a.uri or a.item_id}), 0))
+            for a in artists])
         indexes_xml = {"ignoredArticles": "The El La Los Las Le Les", "index": indexed} if indexed else {"index": []}
         return self._respond({"artists": indexes_xml})
+
+    async def handle_get_artist_list(self, request: web.Request, params: dict[str, str]) -> web.Response:
+        """OpenSubsonic getArtistList:艺术家卡片(播放最多/最近播放/收藏/随机)。
+
+        箭头音乐拿全量 artist 列表后本地按 playCount/starred 排序,
+        所以除了 type 排序,还要靠 _attach_stats 带出真实播放/收藏字段。
+        """
+        atype = (params.get("type") or "alphabeticalByName").lower()
+        size = _safe_int(params.get("size", "500"), 500)
+        offset = _safe_int(params.get("offset", "0"))
+        query = (params.get("query") or "").strip().lower()
+        order_by = {
+            "alphabeticalbyname": "sort_name",
+            "alphabeticalbyartist": "sort_name",
+            "starred": "favorite_timestamp_desc",
+            "favorites": "favorite_timestamp_desc",
+            "byfrequency": "play_count_desc",
+            "bylastplayed": "last_played_desc",
+            "random": "random",
+        }.get(atype, "sort_name")
+        # library_artists 不支持 play_count/last_played 之外的特殊字段?支持,
+        # 已核实 LISTING_SORT_OPTIONS[library_artists] 含全部这几个字段。
+        artists = await self.mass.music.artists.library_items(
+            limit=LIBRARY_MAX,
+            favorite=True if atype in ("starred", "favorites") else None,
+            order_by=order_by)
+        if query:
+            artists = [a for a in artists if query in (a.search_name or a.name or "").lower()
+                       or query in (a.name or "").lower()]
+        album_counts = await self._get_album_count_map()
+        artist_track_counts = await self._artist_track_counts_map()
+        await self._attach_stats(artists, "artists")
+        sliced = artists[offset:offset + size]
+        return self._respond({"artists": {
+            "artist": [_artist_dict(a, album_counts.get(a.uri or a.item_id, 0),
+                                    artist_track_counts.get(
+                                        _lib_numeric_id({"id": a.uri or a.item_id}), 0)) for a in sliced],
+        }})
+
+    async def handle_get_now_playing(self, request: web.Request, params: dict[str, str]) -> web.Response:
+        """OpenSubsonic getNowPlaying:当前歌曲播放卡片。
+
+        桥接不经 MA player(客户端直接 stream),没有实时播放状态。
+        MA 2.11 的 play_history 只记"完整播完"事件,scrobble(submission=false)
+        每次更新的是 media_progress(playlog)表 —— 因此取该表最近 30 分钟内的
+        track 行作近似:客户端起播即会 scrobble,卡片能显示正在播放的歌。
+        """
+        entries: list[dict] = []
+        try:
+            # 注意:不能过滤 provider='library' —— scrobble 经 get_item_by_uri 解析后
+            # playlog 行存的是实际 provider(filesystem_local 等),不是 'library'。
+            rows = await self.mass.music.database.get_rows_from_query(
+                "SELECT item_id, timestamp FROM media_progress "
+                "WHERE media_type='track' "
+                "ORDER BY timestamp DESC LIMIT 10", None, limit=0)
+        except Exception as e:
+            self.logger.debug("getNowPlaying query failed: %r", e)
+            rows = []
+        cutoff = time.time() - 1800
+        for r in rows:
+            if float(r["timestamp"] or 0) < cutoff:
+                break
+            try:
+                track = await self.mass.music.tracks.get_library_item(str(r["item_id"]))
+            except Exception:
+                continue
+            if isinstance(track, Track):
+                await self._attach_stats([track], "tracks")
+                d = _song_dict(track)
+                d["username"] = "admin"
+                d["minutesAgo"] = max(0, int((time.time() - float(r["timestamp"] or 0)) / 60))
+                d["playerId"] = "amcfy-bridge"
+                entries.append(d)
+        return self._respond({"nowPlaying": {"entry": entries}})
 
     async def handle_get_music_folders(self, request: web.Request, params: dict[str, str]) -> web.Response:
         return self._respond({"musicFolders": {"musicFolder": [{"id": 1, "name": "Music"}]}})
@@ -912,29 +1169,41 @@ class AmcfyBridgePlugin(PluginProvider):
         offset = _safe_int(params.get("offset", "0"))
         is_id3 = request.path.removesuffix(".view").endswith("2")
 
+        # v1.3.7: 排序改走 MA 数据库(order_by → sort_field)。之前内存里
+        # getattr(album, "play_count", 0) 恒为 0(模型不携带),导致
+        # frequent/recent/highest/starred 卡片全是乱序。
         albums: list[Album] = []
-        if atype == "newest":
-            all_albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX)
-            all_albums.sort(key=lambda a: a.date_added or 0, reverse=True)
-            albums = all_albums
+        if atype == "newest" or atype == "latest":
+            # latest = Navidrome 扩展(created 语义 = 入库时间),与 newest 一致
+            albums = await self.mass.music.albums.library_items(
+                limit=LIBRARY_MAX, order_by="timestamp_added_desc")
         elif atype == "alphabeticalByName":
             albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX, order_by="name")
         elif atype == "alphabeticalByArtist":
-            albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX, order_by="sort_name")
+            albums = await self.mass.music.albums.library_items(
+                limit=LIBRARY_MAX, order_by="artist_name")
         elif atype == "frequent":
-            all_albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX)
-            all_albums.sort(key=lambda a: getattr(a, "play_count", 0) or 0, reverse=True)
-            albums = all_albums
+            albums = await self.mass.music.albums.library_items(
+                limit=LIBRARY_MAX, order_by="play_count_desc")
+        elif atype == "lastFrequent":
+            # Navidrome 扩展:按上次播放时间
+            albums = await self.mass.music.albums.library_items(
+                limit=LIBRARY_MAX, order_by="last_played_desc")
         elif atype == "recent":
-            all_albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX)
-            all_albums.sort(key=lambda a: getattr(a, "last_played", 0) or 0, reverse=True)
-            albums = [a for a in all_albums if getattr(a, "last_played", 0)]
-        elif atype == "starred":
-            albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX, favorite=True)
+            albums = await self.mass.music.albums.library_items(
+                limit=LIBRARY_MAX, order_by="last_played_desc")
+        elif atype == "starred" or atype == "favorites":
+            # 最近喜爱:按收藏时间(favorite_timestamp),不是入库时间
+            albums = await self.mass.music.albums.library_items(
+                limit=LIBRARY_MAX, favorite=True, order_by="favorite_timestamp_desc")
+        elif atype == "highest":
+            # 评分最高:MA 没有用户评分字段(见 setRating 映射),
+            # 用 play_count 作最接近的可用近似
+            albums = await self.mass.music.albums.library_items(
+                limit=LIBRARY_MAX, order_by="play_count_desc")
         elif atype == "random":
-            all_albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX)
-            random.shuffle(all_albums)
-            albums = all_albums
+            albums = await self.mass.music.albums.library_items(
+                limit=LIBRARY_MAX, order_by="random")
         elif atype == "byYear":
             from_year = _safe_int(params.get("fromyear", "1900"))
             to_year = _safe_int(params.get("toyear", "2100"))
@@ -947,17 +1216,41 @@ class AmcfyBridgePlugin(PluginProvider):
         else:
             albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX)
 
+        # v1.3.7: attach_stats 必须在 frequent/lastFrequent/recent 的 play_count/
+        # last_played 过滤之前跑,否则 _st() 恒空把这些卡片清空。
+        await self._attach_stats(albums, "albums")
+        if atype == "frequent":
+            albums = [a for a in albums if _st(a).get("play_count")]
+        elif atype in ("lastFrequent", "recent"):
+            albums = [a for a in albums if _st(a).get("last_played")]
+
+        # bySongCount = Navidrome 扩展:曲目最多的专辑,需全库计数后内存排
+        if atype == "bySongCount":
+            counts = await self._album_track_counts_map()
+            albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX)
+            albums.sort(
+                key=lambda a: counts.get(_lib_numeric_id({"id": a.uri or a.item_id}), (0, 0))[0],
+                reverse=True)
+            await self._attach_stats(albums, "albums")
+
         sliced = albums[offset:offset + size]
+        counts = await self._album_track_counts_map(
+            [_lib_numeric_id({"id": a.uri or a.item_id}) for a in sliced
+             if isinstance(a, Album)] or None)
         sub_albums = []
         for alb in sliced:
             if isinstance(alb, Album):
-                tracks_for_alb = []
-                try:
-                    tracks_for_alb = await self.mass.music.albums.tracks(alb.item_id, alb.provider)
-                except Exception:
-                    pass
-                dur = sum(getattr(t, "duration", 0) or 0 for t in tracks_for_alb)
-                sub_albums.append(_album_dict(alb, len(tracks_for_alb), dur))
+                cnt, dur = counts.get(_lib_numeric_id({"id": alb.uri or alb.item_id}), (0, 0))
+                if not cnt:
+                    # SQL 统计不到时兜底走控制器
+                    tracks_for_alb = []
+                    try:
+                        tracks_for_alb = await self.mass.music.albums.tracks(alb.item_id, alb.provider)
+                    except Exception:
+                        pass
+                    cnt = len(tracks_for_alb)
+                    dur = sum(getattr(t, "duration", 0) or 0 for t in tracks_for_alb)
+                sub_albums.append(_album_dict(alb, cnt, dur))
             else:
                 sub_albums.append({
                     "id": alb.uri or alb.item_id,
@@ -977,22 +1270,35 @@ class AmcfyBridgePlugin(PluginProvider):
         return await self._handle_search(request, params, "search3")
 
     def _resolve_search_order(self, order: str, by: str) -> str:
-        """Map Navidrome-style search order/by params to MA order_by values."""
+        """Map Navidrome-style search order/by params to MA order_by values.
+
+        v1.3.7: 补 favorites(收藏时间排序,"最近喜爱的歌曲")和 albumCount/
+        artistCount 卡片所需字段。favorite_timestamp 只对 favorite=True 有意义,
+        调用方负责传 filter。
+        """
         order = (order or "name").lower()
-        desc = (by or "ASC").upper() == "DESC"
+        desc = (by or "DESC").upper() == "DESC"
+        if order == "random":
+            return "random"
+        if order == "title":
+            order = "name"
         base = {
             "playdate": "last_played",
             "played": "last_played",
+            "lastplayed": "last_played",
             "playcount": "play_count",
             "created": "timestamp_added",
+            "inserted": "timestamp_added",
+            "favorite": "favorite_timestamp",
+            "favorites": "favorite_timestamp",
+            "favourites": "favorite_timestamp",
+            "rating": "play_count",  # MA 无评分字段,用播放数近似"评分最高"
             "name": "sort_name",
-            "album": "sort_name",
+            "title": "sort_name",
+            "album": "album_name",
             "artist": "artist_name",
             "year": "year",
-            "random": "random",
         }.get(order, "sort_name")
-        if base == "random":
-            return "random"
         return f"{base}_desc" if desc else base
 
     async def _handle_search(self, request: web.Request, params: dict[str, str], search_type: str) -> web.Response:
@@ -1005,13 +1311,46 @@ class AmcfyBridgePlugin(PluginProvider):
         song_offset = _safe_int(params.get("songoffset", "0"))
 
         if not query:
-            order_by = self._resolve_search_order(params.get("order", ""), params.get("by", "ASC"))
-            tracks = await self.mass.music.tracks.library_items(
-                limit=song_count, offset=song_offset, order_by=order_by
-            )
+            # v1.3.7: 空 query 时按 order/by 返回排序列表。之前只回 songs,
+            # 且 artistCount/albumCount>0 的卡片(播放最多/最近添加的艺术家、专辑)
+            # 永远拿到空列表。favorite 类排序同时带 favorite=True 过滤。
+            order = (params.get("order") or "").lower()
+            order_by = self._resolve_search_order(order, params.get("by", "DESC"))
+            fav_filter = {"favorite": True} if order in (
+                "favorite", "favorites", "favourites", "starred") else {}
+            tracks = album_items = artist_items = []
+            if song_count > 0:
+                tracks = await self._ordered_library_items(
+                    self.mass.music.tracks, order_by,
+                    limit=song_count, offset=song_offset, **fav_filter)
+            if album_count > 0:
+                album_items = await self._ordered_library_items(
+                    self.mass.music.albums, order_by,
+                    limit=album_count, offset=album_offset, **fav_filter)
+            if artist_count > 0:
+                artist_items = await self._ordered_library_items(
+                    self.mass.music.artists, order_by,
+                    limit=artist_count, offset=artist_offset, **fav_filter)
+            await self._attach_stats(tracks, "tracks")
+            await self._attach_stats(album_items, "albums")
+            await self._attach_stats(artist_items, "artists")
+            album_counts = await self._get_album_count_map() if artist_items else {}
+            artist_track_counts = await self._artist_track_counts_map() if artist_items else {}
+            album_stat = await self._album_track_counts_map(
+                [_lib_numeric_id({"id": a.uri or a.item_id})
+                 for a in album_items if isinstance(a, Album)] or None) if album_items else {}
             songs = [_song_dict(t) for t in tracks if isinstance(t, Track)]
+            artists = [_artist_dict(a, album_counts.get(a.uri or a.item_id, 0),
+                                    artist_track_counts.get(
+                                        _lib_numeric_id({"id": a.uri or a.item_id}), 0))
+                       for a in artist_items if isinstance(a, Artist)]
+            albums = []
+            for a in album_items:
+                if isinstance(a, Album):
+                    cnt, dur = album_stat.get(_lib_numeric_id({"id": a.uri or a.item_id}), (0, 0))
+                    albums.append(_album_dict(a, cnt, dur))
             key = "searchResult3" if search_type == "search3" else "searchResult2"
-            return self._respond({key: {"artist": [], "album": [], "song": songs}})
+            return self._respond({key: {"artist": artists, "album": albums, "song": songs}})
 
         scope = self.config.get_value(CONF_SEARCH_SCOPE) or "library"
         library_only = scope == "library"
@@ -1334,27 +1673,50 @@ class AmcfyBridgePlugin(PluginProvider):
     async def handle_get_starred(self, request: web.Request, params: dict[str, str]) -> web.Response:
         # v1.3.3: OpenSubsonic tabKey 过滤。空串 = 全部(旧行为),否则只返回
         # artists / albums / songs 之一。客户端不读的部分跳过,减少 MA 查询。
+        # v1.3.7: 支持 order=favorites + 分页(order 由客户端传,箭头音乐
+        # "最近喜爱的歌曲"卡片用 order=favorites&by=DESC + songCount)。
         is_id3 = request.path.removesuffix(".view").endswith("2")
         wrapper = "starred2" if is_id3 else "starred"
         tab_key = params.get("tabkey", "").strip().lower()
         include_artists = tab_key in ("", "artists")
         include_albums = tab_key in ("", "albums")
         include_songs = tab_key in ("", "songs")
+        order = (params.get("order") or "").lower()
+        desc = (params.get("by") or "DESC").upper() == "DESC"
+        if order in ("favorites", "favourites", "favorite", "favourite"):
+            song_order = "favorite_timestamp_desc" if desc else "favorite_timestamp"
+        else:
+            song_order = None
+        song_count = _safe_int(params.get("songcount", "0")) or LIBRARY_MAX
+        song_offset = _safe_int(params.get("songoffset", "0"))
+        artist_count = _safe_int(params.get("artistcount", "0")) or LIBRARY_MAX
+        album_count = _safe_int(params.get("albumcount", "0")) or LIBRARY_MAX
         payload: dict = {}
         album_counts = await self._get_album_count_map()
         if include_artists:
-            artists = await self.mass.music.artists.library_items(limit=LIBRARY_MAX, favorite=True)
-            payload["artist"] = [_artist_dict(a, album_counts.get(a.uri or a.item_id, 0)) for a in artists]
+            artists = await self.mass.music.artists.library_items(
+                limit=artist_count, favorite=True, order_by="favorite_timestamp_desc")
+            await self._attach_stats(artists, "artists")
+            artist_track_counts = await self._artist_track_counts_map() if artists else {}
+            payload["artist"] = [
+                _artist_dict(a, album_counts.get(a.uri or a.item_id, 0),
+                             artist_track_counts.get(
+                                 _lib_numeric_id({"id": a.uri or a.item_id}), 0))
+                for a in artists]
         else:
             payload["artist"] = []
         if include_albums:
-            albums = await self.mass.music.albums.library_items(limit=LIBRARY_MAX, favorite=True)
+            albums = await self.mass.music.albums.library_items(
+                limit=album_count, favorite=True, order_by="favorite_timestamp_desc")
+            await self._attach_stats(albums, "albums")
             payload["album"] = [_album_dict(a) for a in albums]
         else:
             payload["album"] = []
         if include_songs:
-            tracks = await self.mass.music.tracks.library_items(limit=LIBRARY_MAX, favorite=True)
-            payload["song"] = [_song_dict(t) for t in tracks]
+            tracks = await self.mass.music.tracks.library_items(
+                limit=song_count, offset=song_offset, favorite=True, order_by=song_order)
+            await self._attach_stats(tracks, "tracks")
+            payload["song"] = [_song_dict(t) for t in tracks if isinstance(t, Track)]
         else:
             payload["song"] = []
         return self._respond({wrapper: payload})
@@ -1374,7 +1736,33 @@ class AmcfyBridgePlugin(PluginProvider):
                 yield track
 
     async def handle_get_playlists(self, request: web.Request, params: dict[str, str]) -> web.Response:
-        playlists = await self.mass.music.playlists.library_items(limit=LIBRARY_MAX)
+        # v1.3.7: 支持 q(搜索)/sortName/sortChanged 参数;"最近更新的歌单"卡片
+        # 靠 changed 字段(OpenSubsonic 扩展,取 DB timestamp_modified)本地排序。
+        q = (params.get("q") or "").strip().lower()
+        sort_name = (params.get("sortname") or "").lower() in ("true", "1")
+        playlists = await self.mass.music.playlists.library_items(
+            limit=LIBRARY_MAX, search=(q or None),
+            order_by="sort_name" if sort_name else None)
+        await self._attach_stats(playlists, "playlists")
+        # 单独补 timestamp_modified(_attach_stats 不带该列)
+        try:
+            pid_by_nid = {}
+            for p in playlists:
+                nid = str(p.uri or p.item_id).rsplit("/", 1)[-1]
+                if nid.isdigit():
+                    pid_by_nid[int(nid)] = p
+            if pid_by_nid:
+                rows = await self.mass.music.database.get_rows_from_query(
+                    "SELECT item_id, timestamp_modified FROM playlists WHERE item_id IN :ids",
+                    {"ids": list(pid_by_nid)}, limit=0)
+                for r in rows:
+                    p = pid_by_nid.get(int(r["item_id"]))
+                    if p is not None:
+                        st = getattr(p, "_amcfy_stats", None)
+                        if isinstance(st, dict):
+                            st["modified"] = float(r["timestamp_modified"] or 0)
+        except Exception as e:
+            self.logger.debug("playlist changed failed: %r", e)
 
         async def _count(pl):
             cnt = 0
@@ -1399,9 +1787,17 @@ class AmcfyBridgePlugin(PluginProvider):
                 "public": False,
                 "songCount": cnt,
                 "duration": dur,
+                "changed": _format_timestamp(_st(p).get("modified")) if _st(p).get("modified") else None,
                 "created": _format_timestamp(getattr(p, "date_added", None)),
                 "coverArt": _find_image_id(p) if hasattr(p, "metadata") else "",
             })
+        # sortChanged=true / sortChangedDesc=true:最近更新(或最旧)的歌单在前
+        sort_changed = (params.get("sortchanged") or "").lower() in ("true", "1")
+        if sort_changed:
+            # Navidrome: sortChangedDesc=true 为最近在前;缺省 desc,仅显式 ASC 时升序
+            sdesc = (params.get("sortchangeddesc") or "").lower()
+            asc = sdesc in ("false", "0") or (params.get("by") or "").upper() == "ASC"
+            plist.sort(key=lambda d: d.get("changed") or "", reverse=not asc)
         return self._respond({"playlists": {"playlist": plist}})
 
     async def handle_get_playlist(self, request: web.Request, params: dict[str, str]) -> web.Response:
@@ -1453,8 +1849,8 @@ class AmcfyBridgePlugin(PluginProvider):
                     fully_played=submission,
                     seconds_played=_safe_int(params.get("time", "0")),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                self.logger.debug("scrobble failed for %s: %r", track.item_id, e)
         return self._respond()
 
     async def handle_get_artist_info2(self, request: web.Request, params: dict[str, str]) -> web.Response:
