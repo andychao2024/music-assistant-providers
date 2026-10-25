@@ -109,9 +109,10 @@ services:
     network_mode: bridge 
 ```
 
+##### 感谢群友提供的插件思路
+[https://github.com/xcq0607/lxserver](https://github.com/xcq0607/lxserver)
 ##### 现已支持洛雪服务端接入音乐源
-
-[https://github.com/hjy1728/mass-lxmusic-provider](https://github.com/xcq0607/lxserver)
+[https://github.com/hjy1728/mass-lxmusic-provider](https://github.com/hjy1728/mass-lxmusic-provider)
 
 ##### 洛雪服务端 docker compose 版安装（推荐）
 ```
