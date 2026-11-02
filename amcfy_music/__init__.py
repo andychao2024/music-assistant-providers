@@ -2554,6 +2554,12 @@ class AmcfyBridgePlugin(PluginProvider):
             "Access-Control-Allow-Origin": "*",
         }
         file_size = getattr(mapping, "file_size", 0) or 0
+        if file_size <= 0:
+            # local_file 映射的 mapping.file_size 恒为 0,响应就退化成 chunked。
+            # 部分 DLNA 渲染器(实测 EDIFIER MA3 / WiiMu 平台)收不到 Content-Length
+            # 会一直停在 0:00,随后转 PAUSED —— 用户侧表现是「投屏放着放着就断」。
+            # 用 MA 已算好的 stream_details.size 补齐即可。
+            file_size = getattr(stream_details, "size", 0) or 0
         if file_size > 0:
             # BUG #59: Range 请求时,Content-Length 是 seek_pos 起的字节数(客户端期望值)
             # 不是完整文件大小。网易云 CDN 拿完整 FLAC 后切片转发,客户端字节数 = file_size - seek_pos。
